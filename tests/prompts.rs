@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use rmcp::model::{GetPromptRequestParams, GetPromptResult, PromptMessageContent};
 use rmcp::object;
+use tempfile::TempDir;
 
 use common::run_with_server;
 use org_roam_mcp::{Config, RoamServer};
@@ -41,18 +42,21 @@ fn prompt_text(result: &GetPromptResult) -> String {
 }
 
 #[tokio::test]
-async fn both_prompts_are_listed() {
+async fn all_prompts_are_listed() {
     run_with_server(server(), |peer| async move {
         let prompts = peer.list_all_prompts().await.expect("list prompts");
         let names: Vec<&str> = prompts.iter().map(|p| p.name.as_str()).collect();
-        assert!(
-            names.contains(&"summarize-node"),
-            "summarize-node should be listed, got: {names:?}"
-        );
-        assert!(
-            names.contains(&"link-suggestions"),
-            "link-suggestions should be listed, got: {names:?}"
-        );
+        for expected in [
+            "summarize-node",
+            "link-suggestions",
+            "orphan-triage",
+            "tag-suggestions",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "{expected} should be listed, got: {names:?}"
+            );
+        }
 
         // The required argument of each prompt is advertised.
         let summarize = prompts.iter().find(|p| p.name == "summarize-node").unwrap();
@@ -149,6 +153,109 @@ async fn link_suggestions_reports_when_nothing_matches() {
         assert!(
             text.contains("No notes in the org-roam vault lexically match"),
             "expected an honest no-match message, got: {text}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn orphan_triage_lists_orphans_and_excludes_linked_notes() {
+    run_with_server(server(), |peer| async move {
+        let result = peer
+            .get_prompt(GetPromptRequestParams::new("orphan-triage").with_arguments(object!({})))
+            .await
+            .expect("get_prompt orphan-triage");
+        let text = prompt_text(&result);
+
+        assert!(
+            text.contains("## Orphan notes"),
+            "expected the orphan list, got: {text}"
+        );
+        // 'Daily journal' has no id: links, so it is an orphan.
+        assert!(
+            text.contains("Daily journal"),
+            "the orphan 'Daily journal' should be listed, got: {text}"
+        );
+        // The 1111<->2222 pair link each other, so neither is an orphan.
+        assert!(
+            !text.contains("11111111-1111-1111-1111-111111111111"),
+            "linked 'Pastafarian Canticle' must not be triaged as an orphan, got: {text}"
+        );
+        assert!(
+            !text.contains("22222222-2222-2222-2222-222222222222"),
+            "linked 'Noodly Appendage imagery' must not be triaged as an orphan, got: {text}"
+        );
+    })
+    .await;
+}
+
+/// A vault whose only two notes link each other, so it has no orphans.
+fn fully_linked_dir() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("a.org"),
+        ":PROPERTIES:\n:ID: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n:END:\n\
+         #+title: Note A\n\nSee [[id:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb]].\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("b.org"),
+        ":PROPERTIES:\n:ID: bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb\n:END:\n\
+         #+title: Note B\n\nSee [[id:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa]].\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn orphan_triage_reports_when_there_are_no_orphans() {
+    let dir = fully_linked_dir();
+    let cfg = Config::from_args(dir.path(), true, true, None).unwrap();
+    let server = RoamServer::new(cfg).unwrap();
+    run_with_server(server, move |peer| async move {
+        let result = peer
+            .get_prompt(GetPromptRequestParams::new("orphan-triage").with_arguments(object!({})))
+            .await
+            .expect("get_prompt orphan-triage");
+        let text = prompt_text(&result);
+        assert!(
+            text.contains("no orphans to triage"),
+            "expected the no-orphans message, got: {text}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn tag_suggestions_shows_vocabulary_current_tags_and_body() {
+    run_with_server(server(), |peer| async move {
+        let result = peer
+            .get_prompt(
+                GetPromptRequestParams::new("tag-suggestions")
+                    .with_arguments(object!({ "id": "11111111-1111-1111-1111-111111111111" })),
+            )
+            .await
+            .expect("get_prompt tag-suggestions");
+        let text = prompt_text(&result);
+
+        assert!(
+            text.contains("## Existing tag vocabulary"),
+            "expected the vocabulary section, got: {text}"
+        );
+        assert!(
+            text.contains("## Current tags"),
+            "expected the current-tags section, got: {text}"
+        );
+        // This note already carries the `pastafarianism` tag, which is also
+        // part of the vault vocabulary.
+        assert!(
+            text.contains("pastafarianism"),
+            "expected the node's existing tag, got: {text}"
+        );
+        // The note body is embedded so the model can judge relevance.
+        assert!(
+            text.contains("shadow of the meatball"),
+            "expected the note body, got: {text}"
         );
     })
     .await;

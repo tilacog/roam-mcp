@@ -36,7 +36,8 @@ MCP. The 27 tools split into three groups:
   `update_node`, `delete_node`, `rename_node`, `append_to_node`,
   `prepend_to_node`, `add_link`, `insert_anchor`, `daily_capture`.
 - **Resources & prompts**: `org-roam://node/{id}` (+ `#anchor`),
-  `summarize-node`, `link-suggestions`.
+  `summarize-node`, `link-suggestions`, `orphan-triage`,
+  `tag-suggestions`.
 
 Two index backends (auto-selected): the fast `org-roam.db` reader when
 Emacs has a db, otherwise a filesystem scanner. Both backends return
@@ -483,8 +484,15 @@ text) to get just the matching sub-section.
 - `summarize-node({ id })` — builds a prompt asking the model to
   summarize a node's body.
 - `link-suggestions({ draft, limit? })` — builds a prompt that lists
-  candidate nodes and asks the model to suggest which to link from
-  the draft.
+  the nodes whose titles/aliases overlap the draft (ranked by lexical
+  relevance, not an arbitrary slice) and asks the model to suggest
+  which to link from the draft.
+- `orphan-triage({ limit? })` — lists orphan notes (no incoming or
+  outgoing `id:` links) and asks the model to recommend merge / link /
+  delete / keep for each.
+- `tag-suggestions({ id, limit? })` — shows a node's body, its current
+  tags, and the vault's existing tag vocabulary, and asks the model to
+  propose tags that stay consistent with that vocabulary.
 
 ---
 

@@ -36,7 +36,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::index::RoamIndex;
+use crate::index::{NodeMeta, RoamIndex};
 use crate::sync::{DbSyncer, SyncMode};
 use crate::tools::content;
 use crate::tools::query;
@@ -535,6 +535,15 @@ const DEFAULT_LINK_CANDIDATES: usize = 50;
 /// into one prompt by passing a huge `limit`.
 const MAX_LINK_CANDIDATES: usize = 200;
 
+/// Default / hard cap on orphans listed by `orphan-triage`.
+const DEFAULT_TRIAGE_ORPHANS: usize = 50;
+const MAX_TRIAGE_ORPHANS: usize = 200;
+
+/// Default / hard cap on the existing-tag vocabulary shown by
+/// `tag-suggestions` (most-used tags first).
+const DEFAULT_TAG_VOCAB: usize = 100;
+const MAX_TAG_VOCAB: usize = 500;
+
 /// `summarize-node` parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SummarizeNodeParams {
@@ -554,12 +563,48 @@ pub struct LinkSuggestionsParams {
     pub limit: Option<usize>,
 }
 
+/// `orphan-triage` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OrphanTriageParams {
+    /// Maximum number of orphan notes to include. Defaults to 50, capped
+    /// at 200.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// `tag-suggestions` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TagSuggestionsParams {
+    /// The node's :ID:.
+    pub id: String,
+
+    /// Maximum number of existing vault tags to show as vocabulary
+    /// (most-used first). Defaults to 100, capped at 500.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// Truncate `s` to at most `max` characters, on a char boundary. Returns
 /// the (possibly shortened) slice and whether truncation occurred.
 fn truncate_chars(s: &str, max: usize) -> (&str, bool) {
     match s.char_indices().nth(max) {
         Some((idx, _)) => (&s[..idx], true),
         None => (s, false),
+    }
+}
+
+/// Render a node as a Markdown bullet for a prompt: `- [[id:UUID][Title]]`,
+/// with a trailing `(tags: …)` when the node carries tags.
+fn node_bullet(node: &NodeMeta) -> String {
+    if node.tags.is_empty() {
+        format!("- [[id:{}][{}]]", node.id, node.title)
+    } else {
+        format!(
+            "- [[id:{}][{}]] (tags: {})",
+            node.id,
+            node.title,
+            node.tags.join(", ")
+        )
     }
 }
 
@@ -1006,18 +1051,7 @@ impl RoamServer {
         } else {
             let node_list = candidates
                 .iter()
-                .map(|c| {
-                    if c.node.tags.is_empty() {
-                        format!("- [[id:{}][{}]]", c.node.id, c.node.title)
-                    } else {
-                        format!(
-                            "- [[id:{}][{}]] (tags: {})",
-                            c.node.id,
-                            c.node.title,
-                            c.node.tags.join(", ")
-                        )
-                    }
-                })
+                .map(|c| node_bullet(&c.node))
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -1036,6 +1070,112 @@ impl RoamServer {
             user_text,
         )])
         .with_description("Suggest org-roam links for a draft text"))
+    }
+
+    #[prompt(
+        name = "orphan-triage",
+        description = "Build a prompt asking Claude to triage orphan notes (merge / link / delete / keep)"
+    )]
+    async fn orphan_triage(
+        &self,
+        p: Parameters<OrphanTriageParams>,
+    ) -> Result<GetPromptResult, McpError> {
+        let index = self.get_index();
+        let limit =
+            p.0.limit
+                .unwrap_or(DEFAULT_TRIAGE_ORPHANS)
+                .min(MAX_TRIAGE_ORPHANS);
+        let mut orphans = index
+            .orphans()
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let total = orphans.len();
+        orphans.truncate(limit);
+
+        let user_text = if orphans.is_empty() {
+            "Every note in the org-roam vault has at least one incoming or outgoing id: link, \
+             so there are no orphans to triage."
+                .to_string()
+        } else {
+            let node_list = orphans
+                .iter()
+                .map(node_bullet)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let scope = if total > orphans.len() {
+                format!("Below are {} of {} orphan notes", orphans.len(), total)
+            } else {
+                format!("Below are the vault's {} orphan notes", orphans.len())
+            };
+            format!(
+                "{scope} — notes with no incoming or outgoing id: links, so they are \
+                 unreachable from the rest of the graph. For each, recommend one of: \
+                 **merge** into another note (name which), **link** to/from specific notes \
+                 (name which), **delete**, or **keep as-is** — with a one-sentence reason. \
+                 Investigate before deciding: use the search_nodes, search_text, get_node, \
+                 and get_backlinks tools to find related notes rather than guessing.\n\n\
+                 ## Orphan notes\n{node_list}"
+            )
+        };
+        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            user_text,
+        )])
+        .with_description("Triage orphan org-roam notes"))
+    }
+
+    #[prompt(
+        name = "tag-suggestions",
+        description = "Build a prompt asking Claude to suggest tags for a node, reusing the vault's existing tag vocabulary"
+    )]
+    async fn tag_suggestions(
+        &self,
+        p: Parameters<TagSuggestionsParams>,
+    ) -> Result<GetPromptResult, McpError> {
+        let index = self.get_index();
+        let body = content::read_node_body(&index, &p.0.id).map_err(McpError::from)?;
+
+        let vocab_limit = p.0.limit.unwrap_or(DEFAULT_TAG_VOCAB).min(MAX_TAG_VOCAB);
+        let mut tags = index
+            .tags()
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Most-used tags first, then alphabetical, so the vocabulary shown
+        // is stable and leads with the vault's established conventions.
+        tags.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        tags.truncate(vocab_limit);
+
+        let vocab = if tags.is_empty() {
+            "(the vault has no tags yet)".to_string()
+        } else {
+            tags.iter()
+                .map(|(tag, count)| format!("- {tag} ({count})"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let current = if body.node.tags.is_empty() {
+            "(none)".to_string()
+        } else {
+            body.node.tags.join(", ")
+        };
+        let (excerpt, truncated) = truncate_chars(&body.body, MAX_SUMMARY_BODY_CHARS);
+        let note = if truncated {
+            "\n\n[note: the note body above was truncated for length]"
+        } else {
+            ""
+        };
+
+        let user_text = format!(
+            "Suggest tags for the org-roam note titled \"{}\". Prefer tags from the vault's \
+             existing vocabulary (listed below, with usage counts) so tagging stays consistent; \
+             propose a genuinely new tag only when nothing existing fits, and flag it as new \
+             with a brief justification. Do not repeat tags the note already has.\n\n\
+             ## Current tags\n{}\n\n## Existing tag vocabulary\n{}\n\n## Note body\n{}{}",
+            body.node.title, current, vocab, excerpt, note
+        );
+        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            user_text,
+        )])
+        .with_description("Suggest tags for an org-roam node"))
     }
 }
 
@@ -1067,7 +1207,7 @@ impl ServerHandler for RoamServer {
                  Write tools (removed in --read-only): create_node, update_node, delete_node, \
                  rename_node, append_to_node, prepend_to_node, add_link, insert_anchor, \
                  daily_capture. Resources: org-roam://node/{id}. \
-                 Prompts: summarize-node, link-suggestions."
+                 Prompts: summarize-node, link-suggestions, orphan-triage, tag-suggestions."
                     .to_string(),
             )
     }
