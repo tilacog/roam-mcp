@@ -1038,15 +1038,22 @@ impl RoamServer {
         let index = self.get_index();
         let body = content::read_node_body(&index, &p.0.id).map_err(McpError::from)?;
 
+        let stale = body.stale_warning();
         let (excerpt, truncated) = truncate_chars(&body.body, MAX_SUMMARY_BODY_CHARS);
-        let note = if truncated {
-            "\n\n[note: the note body above was truncated for length; summarize what is shown]"
-        } else {
-            ""
-        };
+        let mut suffix = String::new();
+        if truncated {
+            suffix.push_str(
+                "\n\n[note: the note body above was truncated for length; summarize what is shown]",
+            );
+        }
+        if let Some(w) = stale {
+            suffix.push_str("\n\n[note: ");
+            suffix.push_str(w);
+            suffix.push(']');
+        }
         let user_text = format!(
             "Please write a concise summary of the following org-roam note titled \"{}\".\n\n{}{}",
-            body.node.title, excerpt, note
+            body.node.title, excerpt, suffix
         );
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(
             PromptMessageRole::User,
@@ -1186,12 +1193,17 @@ impl RoamServer {
         } else {
             body.node.tags.join(", ")
         };
+        let stale = body.stale_warning();
         let (excerpt, truncated) = truncate_chars(&body.body, MAX_SUMMARY_BODY_CHARS);
-        let note = if truncated {
-            "\n\n[note: the note body above was truncated for length]"
-        } else {
-            ""
-        };
+        let mut note = String::new();
+        if truncated {
+            note.push_str("\n\n[note: the note body above was truncated for length]");
+        }
+        if let Some(w) = stale {
+            note.push_str("\n\n[note: ");
+            note.push_str(w);
+            note.push(']');
+        }
 
         let user_text = format!(
             "Suggest tags for the org-roam note titled \"{}\". Prefer tags from the vault's \

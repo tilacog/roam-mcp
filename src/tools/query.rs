@@ -159,8 +159,12 @@ pub fn get_node(
     p: &Parameters<GetNodeParams>,
 ) -> Result<CallToolResult, McpError> {
     let body = read_node_body(index, &p.0.id).map_err(McpError::from)?;
+    let warning = body.stale_warning();
     let mut out = serde_json::to_value(&body.node).map_err(internal)?;
     out["body"] = body.body.into();
+    if let Some(w) = warning {
+        out["warning"] = w.into();
+    }
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&out).unwrap_or_default(),
     )]))
@@ -578,13 +582,16 @@ pub fn list_anchors(
         .filter(|s| !s.is_empty())
         .collect();
 
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "id": p.0.id,
         "targets": dedicated_targets(&body.body),
         "headlines": headlines,
         "custom_ids": custom_ids,
         "names": name_keywords(&body.body),
     });
+    if let Some(w) = body.stale_warning() {
+        payload["warning"] = w.into();
+    }
     Ok(json_result(&payload))
 }
 
