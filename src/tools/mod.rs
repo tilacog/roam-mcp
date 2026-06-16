@@ -7,6 +7,7 @@
 
 pub mod content;
 pub mod query;
+pub mod retrieval;
 pub mod sync_tool;
 pub mod validation_tools;
 pub mod write;

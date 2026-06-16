@@ -36,10 +36,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::index::{NodeQuery, RoamIndex};
+use crate::index::RoamIndex;
 use crate::sync::{DbSyncer, SyncMode};
 use crate::tools::content;
 use crate::tools::query;
+use crate::tools::retrieval;
 use crate::tools::sync_tool::{self, SyncBackend, SyncDatabaseParams, SyncReport};
 use crate::tools::validation_tools;
 use crate::tools::write as write_tools;
@@ -522,6 +523,18 @@ async fn handle_fs_events(
 
 // ── Prompt params ─────────────────────────────────────────────────────────────
 
+/// Upper bound on the node body interpolated into the `summarize-node`
+/// prompt, in characters. Past this the body is truncated so a single
+/// huge note can't produce an unbounded prompt.
+const MAX_SUMMARY_BODY_CHARS: usize = 50_000;
+
+/// Default number of link candidates surfaced by `link-suggestions`.
+const DEFAULT_LINK_CANDIDATES: usize = 50;
+
+/// Hard cap on link candidates, so a caller can't dump the whole vault
+/// into one prompt by passing a huge `limit`.
+const MAX_LINK_CANDIDATES: usize = 200;
+
 /// `summarize-node` parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SummarizeNodeParams {
@@ -535,9 +548,19 @@ pub struct LinkSuggestionsParams {
     /// Draft text to find link targets for.
     pub draft: String,
 
-    /// Maximum number of candidate nodes to include. Defaults to 50.
+    /// Maximum number of candidate nodes to include. Defaults to 50,
+    /// capped at 200.
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+/// Truncate `s` to at most `max` characters, on a char boundary. Returns
+/// the (possibly shortened) slice and whether truncation occurred.
+fn truncate_chars(s: &str, max: usize) -> (&str, bool) {
+    match s.char_indices().nth(max) {
+        Some((idx, _)) => (&s[..idx], true),
+        None => (s, false),
+    }
 }
 
 // ── Tool dispatch ─────────────────────────────────────────────────────────────
@@ -940,9 +963,15 @@ impl RoamServer {
         let index = self.get_index();
         let body = content::read_node_body(&index, &p.0.id).map_err(McpError::from)?;
 
+        let (excerpt, truncated) = truncate_chars(&body.body, MAX_SUMMARY_BODY_CHARS);
+        let note = if truncated {
+            "\n\n[note: the note body above was truncated for length; summarize what is shown]"
+        } else {
+            ""
+        };
         let user_text = format!(
-            "Please write a concise summary of the following org-roam note titled \"{}\".\n\n{}",
-            body.node.title, body.body
+            "Please write a concise summary of the following org-roam note titled \"{}\".\n\n{}{}",
+            body.node.title, excerpt, note
         );
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(
             PromptMessageRole::User,
@@ -960,27 +989,48 @@ impl RoamServer {
         p: Parameters<LinkSuggestionsParams>,
     ) -> Result<GetPromptResult, McpError> {
         let index = self.get_index();
-        let limit = p.0.limit.unwrap_or(50);
-        let nodes = index
-            .find_nodes(&NodeQuery {
-                query: None,
-                tags: &[],
-                limit: Some(limit),
-            })
+        let limit =
+            p.0.limit
+                .unwrap_or(DEFAULT_LINK_CANDIDATES)
+                .min(MAX_LINK_CANDIDATES);
+        let candidates = retrieval::relevant_candidates(&index, &p.0.draft, limit)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let node_list = nodes
-            .iter()
-            .map(|n| format!("- [[id:{}][{}]]", n.id, n.title))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let user_text = if candidates.is_empty() {
+            format!(
+                "No notes in the org-roam vault lexically match the draft below, so there are \
+                 no link suggestions to offer. The relevant notes may not exist yet, or may use \
+                 different wording than the draft.\n\n## Draft\n{}",
+                p.0.draft
+            )
+        } else {
+            let node_list = candidates
+                .iter()
+                .map(|c| {
+                    if c.node.tags.is_empty() {
+                        format!("- [[id:{}][{}]]", c.node.id, c.node.title)
+                    } else {
+                        format!(
+                            "- [[id:{}][{}]] (tags: {})",
+                            c.node.id,
+                            c.node.title,
+                            c.node.tags.join(", ")
+                        )
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
 
-        let user_text = format!(
-            "Given the draft text below, suggest which of the listed org-roam notes should be \
-             linked. Format each suggestion as [[id:UUID][Title]] with a one-sentence reason.\n\n\
-             ## Draft\n{}\n\n## Available nodes\n{}",
-            p.0.draft, node_list
-        );
+            format!(
+                "Given the draft text below, decide which of the candidate org-roam notes \
+                 genuinely belong as links, and where. The candidates were selected because \
+                 their titles or aliases overlap the draft's wording, so the list is a starting \
+                 point, not a verdict — omit any that do not actually fit. Format each \
+                 suggestion as [[id:UUID][Title]] with a one-sentence reason.\n\n\
+                 ## Draft\n{}\n\n## Candidate notes\n{}",
+                p.0.draft, node_list
+            )
+        };
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(
             PromptMessageRole::User,
             user_text,
