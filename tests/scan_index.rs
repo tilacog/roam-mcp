@@ -88,6 +88,60 @@ fn scan_backlinks() {
 }
 
 #[test]
+fn scan_backlinks_dedup_same_id_at_file_and_headline() {
+    // Regression: a file with the same `:ID:` at the file level AND on a
+    // headline used to produce two backlink records (one per AST section
+    // the link appeared in). The link graph records edges between nodes,
+    // not in-file positions; the second copy was a duplicate the user
+    // could not justify away.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let shared_id = "aaaaaaaa-1111-1111-1111-111111111111";
+    let dest_id = "bbbbbbbb-2222-2222-2222-222222222222";
+
+    // File-level drawer AND a headline with the same id; the link
+    // appears in both the pre-headline section and the headline body.
+    std::fs::write(
+        dir.path().join("dual.org"),
+        format!(
+            ":PROPERTIES:\n:ID:       {shared_id}\n:END:\n#+title: Dual\n\n\
+             pre-body [[id:{dest_id}]]\n\n\
+             * Section\n\
+             :PROPERTIES:\n\
+             :ID:       {shared_id}\n\
+             :END:\n\
+             headline body [[id:{dest_id}]]\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("dest.org"),
+        format!(":PROPERTIES:\n:ID:       {dest_id}\n:END:\n#+title: Dest\n"),
+    )
+    .unwrap();
+
+    let idx = ScanIndex::open(dir.path()).expect("open");
+    let back = idx.backlinks(dest_id).expect("backlinks");
+    let from_shared: Vec<&_> = back.iter().filter(|l| l.source == shared_id).collect();
+    assert_eq!(
+        from_shared.len(),
+        1,
+        "duplicate backlink from {shared_id} to {dest_id}: {back:?}"
+    );
+
+    // Forward links from the shared id should also be unique.
+    let fwd = idx.forward_links(shared_id).expect("forward");
+    let to_dest: Vec<&_> = fwd
+        .iter()
+        .filter(|l| l.dest.as_deref() == Some(dest_id))
+        .collect();
+    assert_eq!(
+        to_dest.len(),
+        1,
+        "duplicate forward link from {shared_id} to {dest_id}: {fwd:?}"
+    );
+}
+
+#[test]
 fn scan_forward_links() {
     let idx = ScanIndex::open(&fixture_dir()).expect("open");
     let links = idx

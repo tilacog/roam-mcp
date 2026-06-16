@@ -432,6 +432,46 @@ not the full schema.
 | `insert_anchor` | `id`, `search_text`, `anchor_name` | Place `<<name>>` before a matched paragraph; returns the `[[id:UUID::name]]` link |
 | `daily_capture` | `content?`, `headline?` | Create or open today's daily; optionally append |
 
+#### Important: `body` is the body, not the file
+
+`update_node`'s `body` parameter is the file's body proper — everything
+after the property drawer and the `#+title:` / `#+filetags:` header
+keywords. It is **not** the whole file. A common mistake is to read
+the file, edit the text in your head, and pass the edited file back
+as the `body`. That silently produces nested `:PROPERTIES:` drawers
+and a `#title:` concatenated with itself (`"2026-06-16 2026-06-16
+2026-06-16"`) because the tool faithfully inserts the body *after*
+the existing header. The tool now rejects bodies that start with
+`:PROPERTIES:` or `#+title:` with a clear error. Manage the title
+and properties through their own parameters instead.
+
+#### Important: `headline` is the title, not the `*` line
+
+`add_link`, `append_to_node`, and `daily_capture` all take an optional
+`headline` parameter that names the *title* of the target headline.
+The matcher strips a leading `*`-marker run, so both `Spec section`
+and `** Spec section` resolve to the same headline. If no headline
+matches, the call is now rejected with a `headline not found` error
+rather than silently appending at end of file (the previous behavior
+that produced the "I added a link under `** Specification (2025-11-25)`
+but it landed somewhere else" complaint).
+
+#### Where daily notes live
+
+`daily_capture` writes to the directory named by `Config::dailies_dir`,
+which the server reads from the `--dailies-dir` CLI flag. When the
+flag is unset, daily notes land at the roam-dir root, which is
+usually *not* where your existing `notes/daily/20260112-dracula-readalong.org`
+files live. If your vault has a daily-notes directory, start the
+server with
+
+```
+--dailies-dir daily --dailies-format %Y-%m-%d
+```
+
+`server_info` now reports the configured `dailies.dir` and emits a
+`dailies.hint` field naming the flag to set when `dir` is `null`.
+
 ### Resources
 
 `org-roam://node/{id}` — the full body of a node. Append `#anchor`

@@ -144,20 +144,67 @@ fn validate_anchor_name(name: &str) -> Result<(), McpError> {
     Ok(())
 }
 
-/// Insert `content` into `text`: after the subtree of the headline titled
-/// `headline` when one matches, otherwise at the end of the text.
-fn insert_under_headline(text: &mut String, headline: Option<&str>, content: &str) {
+/// Locate a headline in `text` by title, returning the byte offset just
+/// past the end of the headline's subtree. The match is by `title_raw`
+/// (the literal text of the headline line, after the `*` markers and
+/// TODO/priority tokens), trimmed on both sides. The caller-supplied
+/// `headline` is also stripped of a leading `*`-marker run (`** `,
+/// `*** `, …) so a user who pastes a full headline line
+/// (`** Specification (2025-11-25)`) still matches the underlying
+/// title (`Specification (2025-11-25)`).
+///
+/// Returns `None` when the title doesn't match any headline. Callers
+/// that require a real match (`add_link`, `append_to_node`,
+/// `daily_capture`) reject on `None` rather than silently falling back
+/// to "append at end of file" — that fallback used to be a
+/// silent-data-loss trap when the user's headline was misspelled or
+/// included the `*` prefix.
+fn locate_headline_subtree_end(text: &str, headline: &str) -> Option<usize> {
+    let needle = strip_headline_stars(headline).trim();
+    if needle.is_empty() {
+        return None;
+    }
+    let doc = OrgDoc::from_text(text.to_string());
+    let hl = doc
+        .headlines()
+        .into_iter()
+        .find(|hl| hl.title_raw().trim() == needle)?;
+    Some(doc.subtree_range(&hl).1)
+}
+
+/// Strip a leading run of `*` and any spaces from `s` — turns
+/// `"** Specification"` into `"Specification"`, leaves
+/// `"Specification"` untouched.
+fn strip_headline_stars(s: &str) -> &str {
+    let trimmed = s.trim_start();
+    let after_stars = trimmed.trim_start_matches('*').trim_start();
+    after_stars
+}
+
+/// Insert `content` into `text`. When `headline` is `Some`, the
+/// content lands at the end of that headline's subtree; when it is
+/// `None`, the content is appended at the end of the file.
+///
+/// # Errors
+///
+/// Returns an error when `headline` is `Some` but no headline with
+/// that title exists in the file. We refuse rather than silently
+/// fall back to "append at end", which previously caused
+/// `add_link` / `append_to_node` / `daily_capture` to put content
+/// in the wrong place with no diagnostic.
+fn insert_under_headline(
+    text: &mut String,
+    headline: Option<&str>,
+    content: &str,
+) -> Result<(), McpError> {
     let insertion = format!("\n{}\n", content.trim_end());
-    let pos = headline
-        .and_then(|h| {
-            let doc = OrgDoc::from_text(text.clone());
-            doc.headlines()
-                .into_iter()
-                .find(|hl| hl.title_raw().trim() == h.trim())
-                .map(|hl| doc.subtree_range(&hl).1)
-        })
-        .unwrap_or(text.len());
+    let pos = match headline {
+        Some(h) => locate_headline_subtree_end(text, h)
+            .ok_or_else(|| McpError::invalid_params(format!("headline not found: {h:?}"), None))?,
+        None => text.len(),
+    };
     text.insert_str(pos, &insertion);
+    Ok(())
 }
 
 /// `create_node` — create a fresh `.org` file with an `:ID:` property.
@@ -264,8 +311,7 @@ pub fn append_to_node(
     let node = node.ok_or_else(|| McpError::invalid_params("node not found", None))?;
 
     rewrite_file(&node.file, |text| {
-        insert_under_headline(text, p.headline.as_deref(), &p.content);
-        Ok(())
+        insert_under_headline(text, p.headline.as_deref(), &p.content)
     })?;
 
     Ok(CallToolResult::success(vec![Content::text("ok")]))
@@ -329,6 +375,15 @@ pub struct DailyCaptureParams {
 /// doesn't exist, a fresh UUID is generated and the file is created
 /// (along with any missing parent directories).
 ///
+/// **Daily-note location.** Where the note lives is controlled by
+/// `Config::dailies_dir`, which the MCP server reads from the
+/// `--dailies-dir` CLI flag. By default it is `None`, so the note
+/// lands at the root of the roam directory. If your vault has a
+/// `notes/daily/` directory (org-roam-dailies' default layout),
+/// start the server with
+/// `--dailies-dir daily --dailies-format %Y-%m-%d` so daily notes
+/// land in the same place Emacs expects to find them.
+///
 /// # Errors
 ///
 /// Returns an error if write operations are disabled, the dailies
@@ -372,8 +427,7 @@ pub fn daily_capture(
 
     if let Some(content) = p.content.filter(|s| !s.trim().is_empty()) {
         rewrite_file(&path, |text| {
-            insert_under_headline(text, p.headline.as_deref(), &content);
-            Ok(())
+            insert_under_headline(text, p.headline.as_deref(), &content)
         })?;
     }
 
@@ -399,8 +453,12 @@ pub struct UpdateNodeParams {
     #[serde(default)]
     pub title: Option<String>,
 
-    /// Replacement body (everything after the header keywords). Omit to
-    /// keep the existing body.
+    /// Replacement body — the file's body proper, i.e. everything
+    /// after the property drawer and the `#+title:` / `#+filetags:`
+    /// header keywords. The file's `:PROPERTIES:` drawer and
+    /// `#+title:` line are managed by the other fields (`title`,
+    /// `tags`, `aliases`, `refs`, `properties`) and must NOT appear
+    /// in this string. Omit to keep the existing body.
     #[serde(default)]
     pub body: Option<String>,
 
@@ -455,9 +513,55 @@ fn apply_node_edits(text: &mut String, p: &UpdateNodeParams) -> Result<(), McpEr
         }
     }
     if let Some(body) = &p.body {
+        if let Some(reason) = body_looks_like_full_file(body) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "the `body` parameter is the file's body — everything after the \
+                     header keywords (`:PROPERTIES:` drawer, `#+title:`, `#+filetags:`, \
+                     ...). It must NOT include those keywords themselves. \
+                     Detected a file-header fragment at the start of the body: {reason}. \
+                     Pass only the lines you want after the header."
+                ),
+                None,
+            ));
+        }
         edit::replace_file_body(text, body);
     }
     Ok(())
+}
+
+/// Detect when a user-supplied `body` for `update_node` looks like a
+/// whole `.org` file rather than the body proper. The tool description
+/// already says "everything after the header keywords", but in
+/// practice users (and agents) sometimes pass a re-read of the file
+/// as the body — which silently produces nested `:PROPERTIES:` /
+/// `#+title:` / `#+filetags:` blocks because the tool faithfully
+/// inserts the body after the existing header. The resulting file is
+/// structurally valid (org accepts it) but a different file than the
+/// caller intended, with the title duplicated three times over and
+/// `get_backlinks` reporting phantom edges.
+///
+/// The check is conservative on purpose: it only rejects bodies that
+/// *clearly* start with a file-header fragment. A body that *happens*
+/// to contain a `:PROPERTIES:` line in the middle (e.g. a section
+/// explaining how to write one) is still accepted.
+fn body_looks_like_full_file(body: &str) -> Option<&'static str> {
+    let mut lines = body.lines();
+    let first = lines.next()?.trim();
+    if first.eq_ignore_ascii_case(":PROPERTIES:") {
+        return Some("starts with `:PROPERTIES:`");
+    }
+    // `#+title:` is a file-level keyword. A body that opens with one
+    // is almost certainly a re-supplied file.
+    if let Some(rest) = first.strip_prefix("#+") {
+        if rest
+            .split_once(':')
+            .is_some_and(|(k, _)| k.eq_ignore_ascii_case("title"))
+        {
+            return Some("starts with `#+title:`");
+        }
+    }
+    None
 }
 
 /// `update_node` — edit a file-level node's title, body, tags, aliases,
@@ -796,8 +900,7 @@ pub fn add_link(
     let description = p.description.unwrap_or(target.title);
     let link = format!("[[id:{}][{}]]", p.target, description);
     rewrite_file(&source.file, |text| {
-        insert_under_headline(text, p.headline.as_deref(), &link);
-        Ok(())
+        insert_under_headline(text, p.headline.as_deref(), &link)
     })?;
 
     let payload = serde_json::json!({ "source": p.id, "target": p.target, "link": link });
@@ -973,14 +1076,14 @@ mod tests {
     #[test]
     fn insert_under_headline_appends_at_end_without_headline() {
         let mut text = String::from("#+title: T\n\nbody\n");
-        insert_under_headline(&mut text, None, "new content");
+        insert_under_headline(&mut text, None, "new content").expect("no headline");
         assert!(text.ends_with("\nnew content\n"));
     }
 
     #[test]
     fn insert_under_headline_inserts_before_next_sibling() {
         let mut text = String::from("#+title: T\n\n* First\nbody\n\n* Second\nother\n");
-        insert_under_headline(&mut text, Some("First"), "added");
+        insert_under_headline(&mut text, Some("First"), "added").expect("First");
         let first_pos = text.find("added").unwrap();
         let second_pos = text.find("* Second").unwrap();
         assert!(
@@ -994,16 +1097,47 @@ mod tests {
         // Regression: this used to loop forever (the last headline has no
         // next sibling).
         let mut text = String::from("#+title: T\n\n* First\nbody\n\n* Last\nbody\n");
-        insert_under_headline(&mut text, Some("Last"), "tail content");
+        insert_under_headline(&mut text, Some("Last"), "tail content").expect("Last");
         assert!(text.contains("tail content"));
         assert!(text.ends_with("\ntail content\n"));
     }
 
     #[test]
-    fn insert_under_missing_headline_appends_at_end() {
+    fn insert_under_missing_headline_returns_error() {
+        // Regression: silently appending at the end of the file used to be
+        // the default, which meant `add_link` / `append_to_node` /
+        // `daily_capture` could land the content in the wrong place with
+        // no diagnostic. The error message names the headline so the
+        // caller can correct it.
         let mut text = String::from("#+title: T\n\n* Only\nbody\n");
-        insert_under_headline(&mut text, Some("No Such"), "fallback");
-        assert!(text.ends_with("\nfallback\n"));
+        let err = insert_under_headline(&mut text, Some("No Such"), "fallback").unwrap_err();
+        assert!(err.to_string().contains("headline not found"), "got: {err}");
+        assert!(
+            !text.contains("fallback"),
+            "text must not be modified when the headline is missing: {text}"
+        );
+    }
+
+    #[test]
+    fn insert_under_headline_strips_leading_stars() {
+        // A caller pasting a full headline line ("** Title") should still
+        // match the underlying title ("Title"). Before this, the silent
+        // fallback hid the bug; now both forms resolve to the same
+        // subtree.
+        let mut text = String::from("#+title: T\n\n* First\nbody\n\n* Second\nother\n");
+        insert_under_headline(&mut text, Some("** First"), "added").expect("** First");
+        let first_pos = text.find("added").unwrap();
+        let second_pos = text.find("* Second").unwrap();
+        assert!(first_pos < second_pos, "got: {text}");
+    }
+
+    #[test]
+    fn insert_under_empty_headline_is_rejected() {
+        // An all-whitespace headline would match every blank-ish title
+        // and is almost certainly a caller bug; reject it explicitly.
+        let mut text = String::from("#+title: T\n\n* First\nbody\n");
+        let err = insert_under_headline(&mut text, Some("   "), "x").unwrap_err();
+        assert!(err.to_string().contains("headline not found"), "got: {err}");
     }
 
     #[test]

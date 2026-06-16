@@ -563,6 +563,22 @@ impl RoamServer {
             .map_err(|e| McpError::internal_error(format!("index error: {e}"), None))?;
         let cfg = &self.config;
         let backend = if cfg.has_db() { "sqlite" } else { "scanner" };
+        // Surface a hint when dailies_dir is unset: `daily_capture` will
+        // land daily notes at the roam-dir root in that case, which
+        // diverges from the org-roam-dailies convention of `notes/daily/`.
+        // The hint names the flag to use so the caller can fix the
+        // config without reading the source.
+        let dailies_dir = cfg.dailies_dir.as_ref().map(|d| d.display().to_string());
+        let dailies_hint = if cfg.dailies_dir.is_none() {
+            Some(
+                "dailies.dir is unset: daily_capture will write to the roam-dir root. \
+                 Pass --dailies-dir (e.g. --dailies-dir daily) and \
+                 --dailies-format %Y-%m-%d to match the org-roam-dailies default layout."
+                    .to_string(),
+            )
+        } else {
+            None
+        };
         let info = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "backend": backend,
@@ -573,8 +589,9 @@ impl RoamServer {
             "db_path": cfg.db_path(),
             "has_db": cfg.has_db(),
             "dailies": {
-                "dir": cfg.dailies_dir,
+                "dir": dailies_dir,
                 "format": cfg.dailies_format,
+                "hint": dailies_hint,
             },
             "sync": {
                 "mode": format!("{:?}", cfg.sync_mode),

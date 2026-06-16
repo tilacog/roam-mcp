@@ -237,6 +237,81 @@ async fn update_node_refuses_to_write_invalid_body() {
 }
 
 #[tokio::test]
+async fn update_node_rejects_body_that_looks_like_a_full_file() {
+    // Regression: passing the whole file (or anything that starts with a
+    // `:PROPERTIES:` drawer / `#+title:` line) as the `body` parameter
+    // used to silently produce nested headers because the body is
+    // inserted *after* the file's existing header. Three nested drawers
+    // and a title concatenated with itself ("X X X") were the
+    // visible symptoms. The fix is to refuse up front.
+    let dir = TempDir::new().expect("tmpdir");
+    let path: PathBuf = dir.path().to_path_buf();
+    let cfg = Config::from_args(&path, false, true, None).unwrap();
+    let server = RoamServer::new(cfg).unwrap();
+
+    run(server, |peer| async move {
+        let (_, create_text) =
+            call_text(&peer, "create_node", object!({ "title": "Body gate" })).await;
+        let created: serde_json::Value = serde_json::from_str(&create_text).unwrap();
+        let id = created["id"].as_str().expect("id").to_string();
+        let file_path = created["file"].as_str().expect("file").to_string();
+        let before = std::fs::read_to_string(&file_path).unwrap();
+
+        // A body that opens with `:PROPERTIES:` — the user's mistake.
+        let body = ":PROPERTIES:\n:ID:       11111111-1111-1111-1111-111111111111\n:END:\n#+title: Body gate\n\nhi\n";
+        let result = peer
+            .call_tool(
+                CallToolRequestParams::new("update_node").with_arguments(object!({
+                    "id": id,
+                    "body": body,
+                })),
+            )
+            .await;
+        let err = result.expect_err("body that starts with a file header must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("body") && msg.contains("header"),
+            "expected an explanatory error, got: {msg}"
+        );
+
+        // File on disk must be untouched.
+        let after = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(after, before, "file must not have been modified");
+
+        // A body that opens with `#+title:` is also rejected.
+        let result2 = peer
+            .call_tool(
+                CallToolRequestParams::new("update_node").with_arguments(object!({
+                    "id": id,
+                    "body": "#+title: Pretends to be a title\nactual body\n",
+                })),
+            )
+            .await;
+        assert!(
+            result2.is_err(),
+            "body starting with #+title: must be rejected, got: {result2:?}"
+        );
+
+        // A body that mentions :PROPERTIES: in the middle is still
+        // accepted (the check is conservative on purpose).
+        let (_, ok_text) = call_text(
+            &peer,
+            "update_node",
+            object!({
+                "id": id,
+                "body": "Intro paragraph mentioning :PROPERTIES: in a sentence.\n",
+            }),
+        )
+        .await;
+        assert!(
+            ok_text.contains("\"updated\": true"),
+            "body that mentions :PROPERTIES: in plain text must be accepted, got: {ok_text}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn update_node_preview_includes_validation_report() {
     let dir = TempDir::new().expect("tmpdir");
     let path: PathBuf = dir.path().to_path_buf();

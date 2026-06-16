@@ -44,6 +44,15 @@ impl ScanIndex {
         let mut forward = walk.forward;
         let backward = resolve_id_slugs_and_build_backward(&mut forward, &walk.nodes, &slug_index);
         reclassify_fuzzy_name_links(&mut forward, &walk.nodes);
+        // Final dedup per source: a file with the same `:ID:` at the
+        // file level and on a headline contributes each link from both
+        // sections, but a logical edge in the link graph is keyed on
+        // (source, dest, kind, raw_dest) and must appear once. The
+        // backward map is already deduped; mirror that here so
+        // `forward_links` matches.
+        for links in forward.values_mut() {
+            dedup_link_records_in_place(links);
+        }
         Ok(Self {
             dir: dir.to_path_buf(),
             nodes: walk.nodes,
@@ -257,6 +266,14 @@ fn unique_slug_index(
 /// when an `id:` link's target is not a known node but matches a
 /// unique file slug, resolve it to that file's node so the link still
 /// joins the graph. `raw_dest` keeps the slug as written.
+///
+/// Edges are deduped by `(source, dest, kind, raw_dest)` so a file
+/// that legitimately carries the same `[[id:X]]` link in two places
+/// (e.g. once in the pre-headline section and once inside a headline
+/// whose `:ID:` is identical to the file's) contributes one
+/// `LinkRecord` per edge, not two. The link graph records edges
+/// between nodes, not in-file positions; counting positions
+/// separately is the source of the "duplicate backlinks" bug.
 fn resolve_id_slugs_and_build_backward(
     forward: &mut HashMap<String, Vec<LinkRecord>>,
     nodes: &HashMap<String, NodeMeta>,
@@ -267,11 +284,40 @@ fn resolve_id_slugs_and_build_backward(
         for l in links.iter_mut() {
             resolve_id_slug(l, nodes, slug_index);
             if let Some(dest) = &l.dest {
-                backward.entry(dest.clone()).or_default().push(l.clone());
+                let entry = backward.entry(dest.clone()).or_default();
+                if !entry
+                    .iter()
+                    .any(|existing| link_key(existing) == link_key(l))
+                {
+                    entry.push(l.clone());
+                }
             }
         }
     }
     backward
+}
+
+/// Identity key for a `LinkRecord` in the link graph: two records with
+/// the same `(source, dest, kind, raw_dest)` represent the same edge
+/// regardless of `ref_target`, which only carries the resolved URL /
+/// @citekey payload for `https` / `http` / `cite` links and is not
+/// what distinguishes one edge from another.
+fn link_key(l: &LinkRecord) -> (String, Option<String>, String, String) {
+    (
+        l.source.clone(),
+        l.dest.clone(),
+        l.kind.clone(),
+        l.raw_dest.clone(),
+    )
+}
+
+/// Drop duplicate `LinkRecord`s from `links` in place, keeping the
+/// first occurrence of each [`link_key`]. The order of the kept
+/// records matches the order in which they were first seen.
+fn dedup_link_records_in_place(links: &mut Vec<LinkRecord>) {
+    let mut seen: std::collections::HashSet<(String, Option<String>, String, String)> =
+        std::collections::HashSet::with_capacity(links.len());
+    links.retain(|l| seen.insert(link_key(l)));
 }
 
 /// If `l` is an `id:` link whose target is not a known node but is a

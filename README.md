@@ -85,6 +85,21 @@ Default transport is **stdio**. Never mix stdout logging with the protocol — i
   3. **`never`**: skip entirely; use `M-x org-roam-db-sync` manually (or rely on `org-roam-db-autosync-mode`).
 - Multiple writes within the debounce window (default 2 s) coalesce into one sync call. Concurrent syncs are serialized to avoid SQLite write-lock races.
 
+## Daily notes
+
+`daily_capture` writes to `--dailies-dir` (default: the roam-dir root).
+If your vault follows the org-roam-dailies layout (`notes/daily/2026-01-12-dracula-readalong.org`),
+launch the server with
+
+```
+--dailies-dir daily --dailies-format %Y-%m-%d
+```
+
+so daily notes land in the same place Emacs expects to find them. The
+`server_info` tool reports the configured `dailies.dir` and a
+`dailies.hint` when it is `null` so the misconfiguration is visible
+from the MCP side without reading the source.
+
 ## Quirks
 
 These are client- / transport-side gotchas, not server bugs, recorded so
@@ -102,6 +117,24 @@ the next caller does not lose time to them:
   triggers the client serializer bug more often, especially when the body
   also contains `[[id:…][…]]` links. Prefer ASCII `-` / `--` in titles;
   em-dashes in the body are fine.
+- **No `org-roam.db` warning in scanner mode.** When the server is
+  running with `--no-db` (or `org-roam.db` does not exist), `server_info`
+  and `sync_database` return `"warnings": ["no org-roam.db present; drift
+  is scanner-only"]`. The warning is informational — the scanner *is*
+  the index in that mode — not a sign of a missing file. The warning
+  is now `debug`-level in the log to stop it from drowning out
+  real issues.
+- **`update_node body` is the body, not the file.** Passing the whole
+  file (or anything starting with `:PROPERTIES:` / `#+title:`) used to
+  silently produce nested drawers and a concatenated title. The tool
+  now rejects such bodies with a clear `invalid_params` error; pass
+  only the lines you want after the header, and use the dedicated
+  parameters for the title, tags, aliases, refs, and `:PROPERTIES:`
+  drawer.
+- **`add_link` / `append_to_node` / `daily_capture headline=`** must
+  match the headline *title* (the matcher strips a leading `** `).
+  An unknown headline used to silently append the content at the end
+  of the file; the tools now refuse with `headline not found`.
 
 ## Project layout
 

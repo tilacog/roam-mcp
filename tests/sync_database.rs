@@ -59,12 +59,17 @@ async fn reports_state_without_syncing() {
             "no db => null sqlite count, got {}",
             v["drift"]["sqlite_node_count"]
         );
+        // The "no org-roam.db" warning used to be returned here. It
+        // was misleading (the scanner is the index in this mode) and
+        // drowned out real warnings. `db_exists: false` already
+        // communicates the state; the warning is gone. Any remaining
+        // warnings must be unrelated to the missing db.
         let warnings = v["warnings"].as_array().expect("warnings array");
         assert!(
-            warnings
+            !warnings
                 .iter()
                 .any(|w| w.as_str().is_some_and(|s| s.contains("no org-roam.db"))),
-            "expected a no-db drift warning, got {warnings:?}"
+            "the noisy no-db warning must not be returned, got {warnings:?}"
         );
     })
     .await;

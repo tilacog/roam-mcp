@@ -163,7 +163,12 @@ pub fn compute_drift(config: &Config) -> (DriftReport, Vec<String>) {
             }
         }
     } else {
-        warnings.push("no org-roam.db present; drift is scanner-only".to_string());
+        // No `org-roam.db` to compare against. This is the steady state
+        // in `--no-db` mode and in any scanner-only deployment; it is
+        // not a problem to flag, just the absence of a second view to
+        // reconcile. `server_info` already reports `has_db: false` for
+        // callers that care, and the scanner still picks up the
+        // authoritative file set on its own.
         (None, Vec::new(), Vec::new())
     };
 

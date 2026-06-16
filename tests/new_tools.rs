@@ -253,6 +253,92 @@ async fn add_link_writes_link_and_shows_in_forward_links() {
 }
 
 #[tokio::test]
+async fn add_link_rejects_unknown_headline() {
+    // Regression: `add_link headline=...` used to silently fall back to
+    // appending at the end of the file when the headline didn't match.
+    // The user-visible symptom was a link landing in the wrong place
+    // with no error to explain why. Now the call is rejected.
+    let dir = TempDir::new().unwrap();
+    run(server(&dir, false), |peer| async move {
+        let (src, src_file) = create(
+            &peer,
+            object!({
+                "title": "Source",
+                "body": "* Real section\nbody\n"
+            }),
+        )
+        .await;
+        let (dst, _) = create(&peer, object!({ "title": "Destination" })).await;
+
+        let params = CallToolRequestParams::new("add_link").with_arguments(object!({
+            "id": src,
+            "target": dst,
+            "headline": "** No Such Section"
+        }));
+        let result = peer.call_tool(params).await;
+        let err = result.expect_err("headline not found must surface as an error");
+        assert!(
+            err.to_string().contains("headline not found"),
+            "expected 'headline not found' in error, got: {err}"
+        );
+
+        // The file must not have been modified.
+        let text = std::fs::read_to_string(&src_file).unwrap();
+        assert!(
+            !text.contains(&format!("[[id:{dst}]")),
+            "link must not have been written: {text}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn add_link_accepts_headline_with_star_prefix() {
+    // A caller pasting a full headline line ("** Title") matches the
+    // underlying title ("Title"). Both forms are accepted; the
+    // previous behavior silently appended to the end.
+    let dir = TempDir::new().unwrap();
+    run(server(&dir, false), |peer| async move {
+        let (src_id, src_file) = create(
+            &peer,
+            object!({
+                "title": "Source",
+                "body": "* Spec section\nspec body\n"
+            }),
+        )
+        .await;
+        let (dst, _) = create(&peer, object!({ "title": "Destination" })).await;
+
+        let res = call(
+            &peer,
+            "add_link",
+            object!({
+                "id": src_id,
+                "target": dst,
+                "headline": "** Spec section"
+            }),
+        )
+        .await;
+        assert!(res["link"].as_str().unwrap().contains(&dst));
+
+        let text = std::fs::read_to_string(&src_file).unwrap();
+        // The link must be inside the Spec section, not after the file.
+        let link_pos = text.find(&format!("[[id:{dst}]")).unwrap();
+        let spec_pos = text.find("* Spec section").unwrap();
+        let tail = text[link_pos..].contains("\n\n");
+        assert!(
+            spec_pos < link_pos,
+            "link must come after the section: {text}"
+        );
+        // No trailing body after the link (we put it at the end of the
+        // section's subtree, which is the end of the file when the
+        // section is the last one).
+        assert!(!tail, "link should be the last thing in the file: {text}");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn list_nodes_paginates() {
     let dir = TempDir::new().unwrap();
     run(server(&dir, false), |peer| async move {
@@ -465,6 +551,28 @@ async fn server_info_reports_backend_and_config() {
         assert_eq!(info["has_db"], Value::Bool(false));
         assert!(info["version"].is_string());
         assert!(info["sync"]["debounce_ms"].is_number());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn server_info_dailies_hint_points_at_dailies_dir_flag() {
+    // When `dailies_dir` is unset, `server_info` must surface a hint
+    // that names the CLI flag the operator can flip. This is what
+    // surfaces the "I have notes/daily/ but daily_capture created the
+    // file at the root" misconfiguration from the MCP side.
+    let dir = TempDir::new().unwrap();
+    run(server(&dir, false), |peer| async move {
+        let info = call(&peer, "server_info", object!({})).await;
+        // dailies.dir is null in the default config.
+        assert!(info["dailies"]["dir"].is_null(), "{info}");
+        let hint = info["dailies"]["hint"]
+            .as_str()
+            .expect("dailies.hint must be a string when dir is null");
+        assert!(
+            hint.contains("--dailies-dir"),
+            "hint must name the CLI flag, got: {hint}"
+        );
     })
     .await;
 }
