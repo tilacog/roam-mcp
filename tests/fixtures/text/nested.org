@@ -1,0 +1,46 @@
+:PROPERTIES:
+:ID:       eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee
+:END:
+#+title: Nested headlines
+
+A file with a deeply nested headline tree. Each headline has its own
+:ID:; anchor resolution must find the right one by CUSTOM_ID, by
+title, or by text.
+
+* Outer
+:PROPERTIES:
+:ID:       eeeeee01-eeee-eeee-eeee-eeeeeeeeeeee
+:CUSTOM_ID: outer
+:END:
+
+<<outer-anchor>> Outer body — lorem ipsum dolor sit amet.
+
+** Middle
+:PROPERTIES:
+:ID:       eeeeee02-eeee-eeee-eeee-eeeeeeeeeeee
+:CUSTOM_ID: middle
+:END:
+
+<<middle-anchor>> Middle body — consectetur adipiscing elit.
+
+*** Inner
+:PROPERTIES:
+:ID:       eeeeee03-eeee-eeee-eeee-eeeeeeeeeeee
+:CUSTOM_ID: inner
+:END:
+
+<<inner-anchor>> Inner body — sed do eiusmod tempor incididunt.
+
+**** Deep
+:PROPERTIES:
+:ID:       eeeeee04-eeee-eeee-eeee-eeeeeeeeeeee
+:END:
+
+Deepest headline — ut enim ad minim veniam.
+
+** Side
+:PROPERTIES:
+:ID:       eeeeee05-eeee-eeee-eeee-eeeeeeeeeeee
+:END:
+
+Side branch, sibling of Middle.

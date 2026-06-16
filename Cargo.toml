@@ -1,0 +1,50 @@
+[package]
+name = "org-roam-mcp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "An MCP server for org-roam knowledge bases"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/local/org-roam-mcp"
+readme = "README.md"
+
+[[bin]]
+name = "org-roam-mcp"
+path = "src/main.rs"
+
+[lib]
+name = "org_roam_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+rmcp = { version = "1.7", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "schemars"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+orgize = { version = "=0.10.0-alpha.10", features = ["indexmap"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+walkdir = "2"
+notify = "7"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+axum = "0.8"
+tower = "0.5"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+rmcp = { version = "1.7", features = ["server", "transport-io", "client", "transport-child-process", "macros", "schemars", "transport-streamable-http-client-reqwest"] }
+orgize = { version = "=0.10.0-alpha.10", features = ["indexmap"] }
+proptest = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

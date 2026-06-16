@@ -1,0 +1,9 @@
+:PROPERTIES:
+:ID:       44444444-4444-4444-4444-444444444444
+:ROAM_REFS: @nora2023
+:END:
+#+title: Nora 2023 notes
+#+filetags: :literature:
+
+A literature note for the @nora2023 citation. find_by_ref should find
+both this node and fsm_canticle.org (which also has @nora2023 in ROAM_REFS).

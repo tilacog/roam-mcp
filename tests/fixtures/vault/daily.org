@@ -1,0 +1,8 @@
+:PROPERTIES:
+:ID:       33333333-3333-3333-3333-333333333333
+:END:
+#+title: Daily journal
+
+A non-related node. The Noodly Appendage and Pastafarian Canticle are not mentioned.
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor.

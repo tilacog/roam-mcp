@@ -1,0 +1,11 @@
+:PROPERTIES:
+:ID:       12345678-1234-1234-1234-123456789012
+:END:
+#+title: Shepherd imagery
+
+A note that mentions The Shepherd Psalm in plain text. The
+unlinked-references tool should pick this up because the alias
+appears here, not inside an org link.
+
+A second paragraph that mentions Psalm 23 — but the title also
+appears as a plain-text reference here.

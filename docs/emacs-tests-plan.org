@@ -1,0 +1,643 @@
+#+title: Emacs Integration Tests: Feature Flag Plan
+#+filetags: :plan:testing:emacs:
+
+* Overview
+
+Introduce a Cargo feature flag =emacs-tests= that gates a 2×2 integration test
+matrix combining two creation paths (Rust vs. Emacs) with two verification paths
+(Rust vs. Emacs). The feature flag exists because (1) CI may not have Emacs
+installed, and (2) maintainers without Emacs should not be blocked by these tests.
+
+** Status of this document
+
+This plan was revised after a second adversarial pass that checked every claim
+against the actual codebase (commit at branch =emacs-tests=). The API
+signatures, helper names, and existing-test references below are verified. The
+sections most changed by that pass are *Runtime Skip*, *Emacs Lisp Scripts*,
+*Rust Helper*, *Assertion Strategy*, and *CI* — see *Adversarial Findings* for
+the full delta and rationale.
+
+** Verified against the codebase
+
+These facts were confirmed by reading the source, not assumed:
+
+- =Config::from_args(roam_dir, read_only, no_db, http)= — exact arg order
+  (=src/config.rs:78=). =no_db = true= forces the filesystem scanner backend.
+- =RoamServer::new(config)= returns =Result= (=src/server.rs:120=).
+- =run_with_server= and =text_of= live in =tests/common/mod.rs=;
+  =run_with_server= imposes a *hard 10-second timeout* and re-raises panics
+  from the client closure.
+- =create_node= returns pretty-printed ={"id","file","slug"}=
+  (=src/tools/write.rs:223=) and writes =:PROPERTIES:= → =:ID:= → =:END:= →
+  =#+title:= → =#+filetags:= (=write.rs:186-208=).
+- =get_node= returns the node's =NodeMeta= fields plus a =body= field
+  (=src/tools/query.rs:157=).
+- The control test the plan mirrors, =create_node_writes_valid_org_file=, really
+  exists in =tests/write_roundtrip.rs:17= and uses
+  =Config::from_args(&path, false, true, None)=.
+- The project *already* drives =org-roam-db-sync= in headless Emacs via
+  =DbSyncer::run_batch_sync= (=src/sync.rs:236=) and already has an
+  =elisp_string= path-escaper (=src/sync.rs:288=). This plan reuses both ideas
+  rather than reinventing them.
+
+* Test Matrix
+
+| Cell | Create          | Read / Verify   | Purpose                          |
+|------+-----------------+-----------------+----------------------------------|
+| A+Y  | Rust MCP server | Rust MCP server | Control arm                      |
+| A+X  | Rust MCP server | Emacs org-roam  | Rust output readable by Emacs    |
+| B+X  | Emacs org-roam  | Rust MCP server | Emacs output readable by Rust    |
+| B+Y  | Emacs org-roam  | Emacs org-roam  | All-Emacs baseline               |
+
+A+Y is the control: if A+Y passes but A+X fails, the fault is in the Emacs read
+path; if both fail, the fault is in the Rust write path.
+
+* Cargo.toml Changes
+
+There is no =[features]= section today. Add one (placement is cosmetic; after
+=[lib]= is fine):
+
+#+begin_src toml
+[features]
+emacs-tests = []
+#+end_src
+
+No new dev-dependencies are needed. The feature gates test code only.
+
+** Footgun: feature name in cfg attributes
+
+The Cargo feature is =emacs-tests= (hyphen). In Rust the cfg attribute must be
+=cfg(feature = "emacs-tests")= — a typo silently compiles an empty test binary.
+
+* File Layout
+
+#+begin_example
+tests/
+  emacs/
+    create_node.el          ;; write a node via Emacs, print JSON to stdout
+    read_node.el            ;; query org-roam node by ID, print JSON to stdout
+  emacs_helper/
+    mod.rs                  ;; find_emacs(), emacs_has_org_roam(),
+                            ;; run_emacs_script(), elisp_string(), require_emacs!()
+  emacs_roundtrip.rs        ;; 4 test cells; #![cfg(feature = "emacs-tests")] at top
+#+end_example
+
+Cargo only treats top-level =tests/*.rs= as test binaries; =tests/emacs_helper/=
+and =tests/common/= are modules (the existing =common/= proves this), and
+=tests/emacs/*.el= are data, never compiled.
+
+=emacs_roundtrip.rs= carries =#![cfg(feature = "emacs-tests")]= at its very top.
+When the feature is off, the entire file — including =mod emacs_helper;= — is
+stripped by the compiler, so =emacs_helper/mod.rs= is never compiled and raises
+no dead-code or unused-import warnings.
+
+* Emacs Lisp Scripts
+
+Both scripts receive inputs via =--eval= forms injected before =--load=. They
+print *one JSON object* to stdout and exit 0 on success.
+
+Two correctness rules (see Findings 5 and 16):
+
+1. Build JSON with =json-encode= (require =json=), never with hand-rolled
+   =format= strings. =format= does not escape =\= or ="= inside a title or
+   path, and the project deliberately exercises odd inputs elsewhere (the fuzz
+   corpus), so a future title containing a quote would silently produce invalid
+   JSON.
+2. The Rust side parses the *last non-empty line* of stdout, not the whole
+   stream, so a stray =message=/=princ= from package init can't corrupt the
+   payload.
+
+** Design rationale: direct file writing, not org-capture
+
+=org-roam-capture= and =org-capture= are interactive; they cannot be driven from
+=--batch= without a full capture-template scaffolding. The correct batch approach
+is to write the =.org= file directly then call =(org-roam-db-sync)= to register
+it. These tests validate that Emacs's org-roam can find and parse the file, not
+that it was created through the UI capture flow.
+
+** Required preamble (both scripts)
+
+Every batch script loads org-roam and isolates *all* Emacs state inside the temp
+vault — critically including =org-id-locations-file= (defaults to
+=~/.emacs.d/.org-id-locations=) and =org-roam-db-location= (defaults to
+=user-emacs-directory=, i.e. =~/.emacs.d/= — true on org-roam v2, not just v1),
+which would otherwise pollute the developer's real Emacs config.
+
+The Rust helper also injects these via =--eval= (defense in depth), so the
+preamble's =setq=s are a belt-and-suspenders second line of defence.
+
+#+begin_src emacs-lisp
+(require 'package)
+(package-initialize)                        ; --batch does not auto-initialize
+(require 'json)
+(require 'org-roam)
+(setq org-roam-db-location
+      (expand-file-name "org-roam.db" org-roam-directory))
+(setq org-id-locations-file                 ; isolate from ~/.emacs.d/
+      (expand-file-name ".org-id-locations" org-roam-directory))
+#+end_src
+
+** create_node.el
+
+Inputs (via =--eval= before =--load=): =create-title=, =create-tags=,
+=org-roam-directory= (always injected by the Rust helper).
+
+#+begin_src emacs-lisp
+(require 'package)
+(package-initialize)
+(require 'json)
+(require 'org-roam)
+(setq org-roam-db-location
+      (expand-file-name "org-roam.db" org-roam-directory))
+(setq org-id-locations-file
+      (expand-file-name ".org-id-locations" org-roam-directory))
+
+(let* ((id (org-id-new))
+       (slug (replace-regexp-in-string "[^a-z0-9]+" "-" (downcase create-title)))
+       (file (expand-file-name (concat id "-" slug ".org") org-roam-directory))
+       (tags-str (when create-tags
+                   (concat ":" (mapconcat #'identity create-tags ":") ":"))))
+  (with-temp-file file
+    (insert ":PROPERTIES:\n")
+    (insert (format ":ID:       %s\n" id))
+    (insert ":END:\n")
+    (insert (format "#+title: %s\n" create-title))
+    (when tags-str (insert (format "#+filetags: %s\n" tags-str))))
+  (org-roam-db-sync)
+  ;; json-encode escapes the values; print exactly one line.
+  (princ (json-encode (list (cons "id" id) (cons "file" file))))
+  (terpri))
+#+end_src
+
+Stdout contract (last line):
+#+begin_example
+{"id":"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx","file":"/tmp/.../uuid-slug.org"}
+#+end_example
+
+** read_node.el
+
+Inputs: =target-node-id=, =org-roam-directory=.
+
+=(org-roam-db-sync)= is called unconditionally — it re-indexes from disk, which
+is essential after the Rust server has written a file and shut down.
+
+#+begin_src emacs-lisp
+(require 'package)
+(package-initialize)
+(require 'json)
+(require 'org-roam)
+(setq org-roam-db-location
+      (expand-file-name "org-roam.db" org-roam-directory))
+(setq org-id-locations-file
+      (expand-file-name ".org-id-locations" org-roam-directory))
+
+(org-roam-db-sync)
+(let ((node (org-roam-node-from-id target-node-id)))
+  (if (null node)
+      (progn
+        (princ (json-encode '(("found" . :json-false))))
+        (terpri)
+        (kill-emacs 1))
+    (princ (json-encode (list (cons "found" t)
+                              (cons "id" (org-roam-node-id node))
+                              (cons "title" (org-roam-node-title node))
+                              (cons "file" (org-roam-node-file node)))))
+    (terpri)))
+#+end_src
+
+Stdout on success (last line):
+#+begin_example
+{"found":true,"id":"...","title":"...","file":"..."}
+#+end_example
+
+* Rust Helper (tests/emacs_helper/mod.rs)
+
+** find_emacs
+
+Resolves the Emacs executable. Note the binary is ="emacs"= on Debian/Ubuntu
+even when only the =emacs-nox= *package* is installed (=emacs-nox= provides
+=/usr/bin/emacs=; there is no =emacs-nox= binary). Try ="emacs"= first, then
+="emacs-nox"= as a fallback for the rare distro that names it that way. Returns
+=None= if neither is on PATH.
+
+** emacs_has_org_roam — the missing half of the skip gate
+
+A bare binary check is *not enough*. A developer can have Emacs installed but no
+org-roam (confirmed on this machine: Emacs 31, no org-roam → =(require
+'org-roam)= errors). Without this probe, every cell would *fail* instead of
+skipping. Run a cheap one-shot probe and cache it:
+
+#+begin_src rust
+use std::sync::OnceLock;
+
+/// `Some(bin)` only if Emacs is present *and* org-roam can be loaded.
+pub fn usable_emacs() -> Option<&'static str> {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let bin = find_emacs()?;
+            let ok = std::process::Command::new(&bin)
+                .args(["--batch", "-Q", "--eval",
+                       "(progn (require 'package) (package-initialize) (require 'org-roam))"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            ok.then_some(bin)
+        })
+        .as_deref()
+}
+#+end_src
+
+** require_emacs! macro
+
+Must be a =#[macro_export]= macro (not a function) because it needs to =return=
+from the *calling* test function. When Emacs or org-roam is absent the test
+returns early and *passes* — the accepted Rust idiom for a runtime skip. It gates
+on =usable_emacs()=, so the skip covers the org-roam-missing case too.
+
+#+begin_src rust
+#[macro_export]
+macro_rules! require_emacs {
+    () => {
+        match $crate::emacs_helper::usable_emacs() {
+            Some(b) => b,
+            None => {
+                eprintln!("SKIP: usable emacs (with org-roam) not found");
+                return;
+            }
+        }
+    };
+}
+#+end_src
+
+** run_emacs_script
+
+Always injects =org-roam-directory=, =org-roam-db-location=, and
+=org-id-locations-file= so DB isolation is guaranteed at the Rust level
+regardless of what the =.el= script sets. *Paths are escaped* via a local
+=elisp_string= (mirroring =src/sync.rs:288=) so a vault path containing a quote
+or backslash can't break the injected form — the raw =format!("\"{}\"", ...)=
+approach in the previous draft was unsafe and inconsistent with the project's
+own code.
+
+#+begin_src rust
+/// Render `s` as a quoted elisp string literal. Mirror of `src/sync.rs`.
+fn elisp_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+pub fn run_emacs_script(
+    bin: &str,
+    script: &Path,
+    eval_forms: &[String],
+    vault: &Path,
+) -> EmacsResult {
+    let dir = elisp_string(&vault.display().to_string());
+    let mut cmd = Command::new(bin);
+    // -Q (not just --no-init-file): also skips site-lisp, matching the
+    // project's own batch sync for reproducibility.
+    cmd.args(["--batch", "-Q"]);
+    cmd.arg("--eval").arg(format!("(setq org-roam-directory {dir})"));
+    cmd.arg("--eval")
+       .arg(r#"(setq org-roam-db-location (expand-file-name "org-roam.db" org-roam-directory))"#);
+    cmd.arg("--eval")
+       .arg(r#"(setq org-id-locations-file (expand-file-name ".org-id-locations" org-roam-directory))"#);
+    for form in eval_forms {
+        cmd.arg("--eval").arg(form);
+    }
+    cmd.arg("--load").arg(script);
+    let out = cmd.output().expect("failed to spawn emacs");
+    EmacsResult {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        status: out.status,
+    }
+}
+
+/// Parse the last non-empty stdout line as JSON (Finding 16).
+pub fn last_json(stdout: &str) -> serde_json::Value {
+    let line = stdout.lines().rev().find(|l| !l.trim().is_empty())
+        .unwrap_or_else(|| panic!("emacs produced no stdout: {stdout:?}"));
+    serde_json::from_str(line)
+        .unwrap_or_else(|_| panic!("invalid JSON from emacs: {line:?}"))
+}
+#+end_src
+
+Caller-supplied =eval_forms= in this plan only ever interpolate UUIDs and
+literal test titles, so they are safe as-is; if a future test injects arbitrary
+strings, route them through =elisp_string= too.
+
+* The Four Test Functions
+
+All live in =tests/emacs_roundtrip.rs=. The file opens with the full set of
+imports the cells use (the previous draft omitted these):
+
+#+begin_src rust
+#![cfg(feature = "emacs-tests")]
+
+mod common;
+mod emacs_helper;
+
+use std::path::PathBuf;
+
+use rmcp::model::CallToolRequestParams;
+use rmcp::object;
+use tempfile::TempDir;
+
+use common::{run_with_server, text_of};
+use org_roam_mcp::sync::SyncMode;
+use org_roam_mcp::{Config, RoamServer};
+
+use emacs_helper::{last_json, run_emacs_script};
+
+fn script(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests").join("emacs").join(name)
+}
+
+/// Build a test config and disable post-write db-sync (Finding 6): otherwise
+/// `create_node` schedules a debounced `emacsclient` probe that can reach a
+/// developer's live Emacs daemon and sync *their* vault.
+fn test_cfg(vault: &std::path::Path, read_only: bool) -> Config {
+    let mut cfg = Config::from_args(vault, read_only, true, None).unwrap();
+    cfg.sync_mode = SyncMode::Never;
+    cfg
+}
+#+end_src
+
+** A+Y: Rust creates, Rust reads (control arm)
+
+Mirrors =create_node_writes_valid_org_file= in =write_roundtrip.rs= but routed
+through =test_cfg= and asserting via =get_node= rather than re-scanning. Its
+value here is as the control: a failure in this cell means the problem is in the
+Rust write path, not in any Emacs interaction. (No Emacs; do *not* gate it on
+=require_emacs!= so it always runs.)
+
+** A+X: Rust creates, Emacs reads
+
+=run_with_server= resolves and the Rust server is torn down *before* Emacs is
+invoked — no file-lock race, and the synchronous =atomic_write= has already
+landed the file on disk. The created node ID is captured across the async
+boundary via =Arc<Mutex<String>>=. Emacs is spawned *after* =run_with_server=
+returns so its blocking process never stalls the single-threaded test runtime.
+
+#+begin_src rust
+#[tokio::test]
+async fn cell_ax_rust_creates_emacs_reads() {
+    let emacs = require_emacs!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().to_path_buf();
+    let server = RoamServer::new(test_cfg(&vault, false)).unwrap();
+
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let cap2 = captured.clone();
+    run_with_server(server, move |peer| async move {
+        let result = peer.call_tool(
+            CallToolRequestParams::new("create_node")
+                .with_arguments(object!({ "title": "AX Test Node", "tags": ["emacs-test"] })),
+        ).await.expect("create_node");
+        let parsed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        *cap2.lock().unwrap() = parsed["id"].as_str().unwrap().to_string();
+    }).await;
+
+    let node_id = captured.lock().unwrap().clone();
+    assert!(!node_id.is_empty());
+
+    let res = run_emacs_script(
+        &emacs, &script("read_node.el"),
+        &[format!(r#"(setq target-node-id "{node_id}")"#)],
+        &vault,
+    );
+    assert!(res.status.success(), "emacs failed\nstderr: {}", res.stderr);
+    let parsed = last_json(&res.stdout);
+    assert_eq!(parsed["found"], true);
+    assert_eq!(parsed["title"].as_str().unwrap(), "AX Test Node");
+    assert_eq!(parsed["id"].as_str().unwrap(), node_id);
+}
+#+end_src
+
+** B+X: Emacs creates, Rust reads
+
+The Emacs =create_node.el= run also writes =<vault>/org-roam.db=; because the
+server is built with =no_db = true= (the scanner backend), that DB is ignored
+and the scanner re-indexes the =.org= file directly. Assertion is on the parsed
+=title= field, *not* a substring of the whole body (Finding 7 / Assertion
+Strategy).
+
+#+begin_src rust
+#[tokio::test]
+async fn cell_bx_emacs_creates_rust_reads() {
+    let emacs = require_emacs!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().to_path_buf();
+
+    let res = run_emacs_script(
+        &emacs, &script("create_node.el"),
+        &[
+            r#"(setq create-title "BX Test Node")"#.to_string(),
+            r#"(setq create-tags (list "emacs-test"))"#.to_string(),
+        ],
+        &vault,
+    );
+    assert!(res.status.success(), "emacs create failed\nstderr: {}", res.stderr);
+    let node_id = last_json(&res.stdout)["id"].as_str().unwrap().to_string();
+    assert!(!node_id.is_empty());
+
+    let server = RoamServer::new(test_cfg(&vault, true)).unwrap();
+    run_with_server(server, move |peer| async move {
+        let get = peer.call_tool(
+            CallToolRequestParams::new("get_node")
+                .with_arguments(object!({ "id": node_id })),
+        ).await.expect("get_node");
+        let parsed: serde_json::Value = serde_json::from_str(&text_of(&get)).unwrap();
+        assert_eq!(parsed["title"].as_str().unwrap(), "BX Test Node");
+        assert_eq!(parsed["id"].as_str().unwrap(), node_id);
+    }).await;
+}
+#+end_src
+
+** B+Y: Emacs creates, Emacs reads
+
+#+begin_src rust
+#[tokio::test]
+async fn cell_by_emacs_creates_emacs_reads() {
+    let emacs = require_emacs!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().to_path_buf();
+
+    let cr = run_emacs_script(
+        &emacs, &script("create_node.el"),
+        &[
+            r#"(setq create-title "BY Test Node")"#.to_string(),
+            r#"(setq create-tags (list "emacs-test"))"#.to_string(),
+        ],
+        &vault,
+    );
+    assert!(cr.status.success(), "stderr: {}", cr.stderr);
+    let node_id = last_json(&cr.stdout)["id"].as_str().unwrap().to_string();
+
+    let rr = run_emacs_script(
+        &emacs, &script("read_node.el"),
+        &[format!(r#"(setq target-node-id "{node_id}")"#)],
+        &vault,
+    );
+    assert!(rr.status.success(), "stderr: {}", rr.stderr);
+    let parsed = last_json(&rr.stdout);
+    assert_eq!(parsed["found"], true);
+    assert_eq!(parsed["title"].as_str().unwrap(), "BY Test Node");
+}
+#+end_src
+
+* Assertion Strategy
+
+Do *not* assert on raw file bytes or string fragments like
+=body.contains("#+title:")= — and note this also rules out
+=body.contains("BX Test Node")= on the whole =get_node= payload, which an
+earlier draft of B+X used. Emacs may reformat =:ID:= padding, change keyword
+case (=#+TITLE:= vs =#+title:=), or insert blank lines.
+
+Assert on parsed semantics only — deserialize the JSON the =.el= script prints
+(via =last_json=), or read the structured field from =get_node='s JSON:
+
+#+begin_src rust
+// Good
+assert_eq!(parsed["title"].as_str().unwrap(), "AX Test Node");
+assert_eq!(parsed["id"].as_str().unwrap(), created_id);
+
+// Bad — brittle across Emacs versions and configurations
+assert!(body.contains("#+title: AX Test Node"));
+#+end_src
+
+** Path canonicalization caveat (low impact)
+
+=Config::from_args= canonicalizes =roam_dir=, but the helper passes the
+un-canonicalized =TempDir= path to Emacs. On Linux temp dirs these coincide; on
+macOS =/var= → =/private/var= and =/tmp= → =/private/tmp= differ. Lookups are by
+=:ID:= and the file is physically present under both spellings, so the tests
+still pass — but if a future assertion compares =file= paths between the two
+tools, canonicalize both sides first.
+
+* CI
+
+*There is no CI workflow in the repo today* (no =.github/= directory). This plan
+must therefore create =.github/workflows/ci.yml= *in full* — the previous draft's
+"Existing job: cargo test (unchanged)" was incorrect. Two jobs, not a matrix:
+the Emacs install (MELPA fetch + compile) takes minutes and is unrelated to the
+Rust build.
+
+#+begin_src yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+      # Lint the emacs-gated code WITHOUT installing Emacs: clippy only
+      # compiles it, it does not run it. This is where Finding 8/11 is caught.
+      - run: cargo clippy --all-targets --features emacs-tests -- -W clippy::pedantic -D warnings
+
+  emacs-roundtrip:
+    # ubuntu-24.04 ships Emacs 29.x with built-in sqlite, which current
+    # org-roam/emacsql (4.x from MELPA) REQUIRE. ubuntu-22.04 ships Emacs 27.1
+    # and will fail at `org-roam-db-sync` (Finding 2).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Emacs
+        run: sudo apt-get update && sudo apt-get install -y emacs-nox
+      - name: Cache MELPA packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.emacs.d/elpa
+          key: elpa-${{ runner.os }}-orgroam-v1
+      - name: Install org-roam from MELPA
+        run: |
+          emacs --batch -Q \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            --eval "(unless (package-installed-p 'org-roam) (package-refresh-contents) (package-install 'org-roam))"
+      - uses: dtolnay/rust-toolchain@stable
+      # Scope to the new binary so the whole suite isn't re-run single-threaded.
+      - run: cargo test --features emacs-tests --test emacs_roundtrip -- --test-threads=1
+#+end_src
+
+** Emacs version is load-bearing
+
+=org-roam-db-sync= goes through =emacsql=, and =emacsql= 4.x (what MELPA serves)
+requires Emacs 29+'s *built-in* sqlite. On Emacs 27/28 you would instead need
+=emacsql='s old subprocess backend, which =package-install= tries to *compile*
+(needs a C toolchain and is flaky). Pin to Emacs ≥29. =purcell/setup-emacs= with
+an explicit version (e.g. =30.1=) is a more reproducible alternative to
+=apt-get= if the runner image drifts.
+
+** Reproducibility of org-roam itself
+
+=(package-install 'org-roam)= grabs whatever MELPA serves today. A future MELPA
+bump that raises org-roam/emacsql's minimum Emacs version would break this job
+silently. Mitigations: the =actions/cache= step above (pins to a working set
+until the key is bumped), or vendor a pinned org-roam + emacsql checkout and set
+=load-path= explicitly.
+
+** --test-threads=1 (resource measure, not a correctness fix)
+
+Each test uses its own =TempDir= vault, and =org-roam-db-location= +
+=org-id-locations-file= are isolated per-vault, so parallel runs do *not* race on
+shared files — the previous draft's rationale ("share ~/.emacs.d/ state") was
+wrong. The real reason to serialize is to avoid several heavyweight
+=emacs --batch= + =org-roam-db-sync= processes contending for CPU/memory on a
+small runner. Keep it for stability; drop it only if the cells prove cheap.
+
+** Linting
+
+Handled in the =test= job above (=cargo clippy ... --features emacs-tests=),
+which needs no Emacs binary. Also add a Justfile recipe so it's runnable locally,
+matching the existing =clippy= recipe's flags:
+
+#+begin_src makefile
+clippy-emacs:
+    cargo clippy --all-targets --features emacs-tests -- -W clippy::pedantic -D warnings
+#+end_src
+
+Consider adding =clippy-emacs= to the =ci= recipe in the =Justfile= so a local
+=just ci= covers the gated code too.
+
+* Adversarial Findings
+
+Issues surfaced during design review, in order of severity. Rows 10–17 were
+added by the second pass against the live codebase.
+
+| #  | Severity | Issue                                                              | Mitigation                                                              |
+|----+----------+--------------------------------------------------------------------+-------------------------------------------------------------------------|
+|  1 | HIGH     | =org-roam= not in apt; =(require 'org-roam)= fails cold            | =package-initialize= + MELPA install step in CI                         |
+|  2 | HIGH     | Emacs 27.1 (ubuntu-22.04) can't run emacsql 4.x / org-roam-db-sync | Use ubuntu-24.04 / Emacs ≥29 (built-in sqlite)                          |
+|  3 | HIGH     | =org-roam-capture= is interactive; unusable in =--batch=          | Write =.org= file directly + =org-roam-db-sync=                         |
+|  4 | HIGH     | =org-id-locations-file= pollutes =~/.emacs.d/=                     | Set it inside the temp vault in every script *and* the Rust helper      |
+|  5 | HIGH     | =org-roam-db-location= defaults to =user-emacs-directory=          | Explicitly set in both Rust helper and each =.el= script                |
+|  6 | HIGH     | Formatting divergence breaks string assertions                     | Assert on parsed semantics, not raw bytes                               |
+|  7 | HIGH     | Skip gate checks the binary but not org-roam → tests *fail* not skip | =usable_emacs()= probe: also =(require 'org-roam)= before deciding     |
+|  8 | MEDIUM   | Default =SyncMode::ClientOnly= can sync a dev's *live* Emacs daemon | Set =cfg.sync_mode = SyncMode::Never= in every test config              |
+|  9 | MEDIUM   | Hand-rolled =format= JSON in elisp doesn't escape =\= / ="=        | Build payloads with =json-encode=                                       |
+| 10 | MEDIUM   | Unescaped path injection in =run_emacs_script=                     | Quote via =elisp_string= (mirror of =src/sync.rs:288=)                  |
+| 11 | MEDIUM   | Runtime skip must pass, not panic                                  | =require_emacs!()= returns early from the test function                 |
+| 12 | MEDIUM   | =clippy --all-targets= skips emacs-gated code                      | =cargo clippy --features emacs-tests= in the *normal* CI job + Justfile |
+| 13 | MEDIUM   | No CI workflow exists; can't "extend" a non-existent job           | Author the whole =ci.yml= (base =test= job + =emacs-roundtrip= job)     |
+| 14 | LOW      | B+X drafted with =body.contains(...)= — the brittle pattern        | Parse JSON, assert on =title=/=id=                                      |
+| 15 | LOW      | Parallel emacs tests assumed to race on shared state               | State is per-vault isolated; =--test-threads=1= is a resource measure   |
+| 16 | LOW      | Stray stdout from package init could corrupt the JSON parse        | Parse the last non-empty stdout line (=last_json=)                      |
+| 17 | LOW      | =emacs= vs =emacs-nox=: =emacs-nox= is a package, the binary is =emacs= | =find_emacs()= tries =emacs= first; =emacs-nox= is a rare fallback  |
+| 18 | LOW      | =Config::from_args= canonicalizes roam_dir; helper passes raw path | Fine on Linux; canonicalize both sides if ever comparing file paths     |
+
+* Out of Scope (Known Follow-ons)
+
+The initial matrix intentionally does not cover:
+
+- Update/edit round-trips (Rust writes, Emacs edits via =org-entry-put=, Rust reads back).
+- Headline nodes (a =* Heading= with its own =:ID:= takes a different parse path).
+- Link resolution (=[[id:UUID]]= must be resolvable by both tools).
+- Aliases and refs round-trips.
+- Concurrent-access races (Emacs and Rust writing the same file simultaneously).
+- Titles with embedded quotes/backslashes/Unicode — would exercise the
+  =json-encode= path and =create_node='s slugging; worth a dedicated cell once
+  the matrix is green.

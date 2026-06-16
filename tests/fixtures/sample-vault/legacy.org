@@ -1,0 +1,16 @@
+:PROPERTIES:
+:ID:       44444444-4444-4444-4444-444444444444
+:END:
+#+TITLE: Legacy conventions
+#+ROAM_TAGS: legacy hub
+#+ROAM_KEY: legacy-key
+
+A note kept in org-roam v1 style: tags and the ref live in file
+keywords instead of #+filetags: and ROAM_REFS.
+
+* Culinary themes
+:PROPERTIES:
+:ID:       55555555-5555-5555-5555-555555555555
+:END:
+
+The noodle as a culinary motif.

@@ -1,0 +1,34 @@
+:PROPERTIES:
+:ID:       aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
+:END:
+#+title: Multi headline test
+#+filetags: :test:fixture:
+
+This file has a file-level ID and several headlines — some with their
+own :ID:, some without. Use it to verify how the scanner attributes
+headlines.
+
+* Alpha
+:PROPERTIES:
+:ID:       bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb
+:END:
+
+Alpha body — first child of the file.
+
+* Beta
+:PROPERTIES:
+:ID:       cccccccc-cccc-cccc-cccc-cccccccccccc
+:END:
+
+Beta body — has its own ID.
+
+* Gamma (no id)
+
+Gamma has no :ID:, so its contents should attribute to the file-level node.
+
+* Delta
+:PROPERTIES:
+:ID:       dddddddd-dddd-dddd-dddd-dddddddddddd
+:END:
+
+Delta body — link to Alpha: [[id:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb]].

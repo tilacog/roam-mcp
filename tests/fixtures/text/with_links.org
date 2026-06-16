@@ -1,0 +1,29 @@
+:PROPERTIES:
+:ID:       11111111-2222-3333-4444-555555555555
+:END:
+#+title: Link variety
+
+A file that contains every kind of org link the scanner needs to
+classify.
+
+* Inline links
+
+An [[id:22222222-3333-4444-5555-666666666666][id link]] to another node.
+
+A [[https://example.com][https link]].
+
+A [[file:another.org::*Heading][file link with headline]].
+
+A [[file:another.org::#custom-id][file link with custom id]].
+
+A [[roam:Some Title][legacy roam link]].
+
+* Citation
+
+A bibliographic citation: [cite:@nora2023; @smith2020 p. 41].
+
+* Multi-line body
+
+Lorem ipsum dolor sit amet. See [[id:22222222-3333-4444-5555-666666666666]]
+for the canonical note. Multiple links to the same target are normal
+and should all be recorded.

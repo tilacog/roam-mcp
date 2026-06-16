@@ -1,0 +1,25 @@
+:PROPERTIES:
+:ID:       11111111-1111-1111-1111-111111111111
+:ROAM_ALIASES: "Ps FSM" "The Noodly Psalm"
+:ROAM_REFS: https://en.wikipedia.org/wiki/Flying_Spaghetti_Monster @nora2023
+:END:
+#+title: Pastafarian Canticle
+#+filetags: :pastafarianism:canticles:
+
+* Verse 1
+:PROPERTIES:
+:CUSTOM_ID: v1
+:END:
+
+<<verse-1>> The Flying Spaghetti Monster is my sauce; I shall not want for flavor.
+
+* Verse 4
+:PROPERTIES:
+:CUSTOM_ID: v4
+:END:
+
+<<verse-4>> Yea, though I walk through the valley of the shadow of the meatball, I will fear no evil: for thou art saucy with me.
+
+* Links
+
+See also [[id:22222222-2222-2222-2222-222222222222]] for the related note.

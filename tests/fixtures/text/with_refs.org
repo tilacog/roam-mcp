@@ -1,0 +1,9 @@
+:PROPERTIES:
+:ID:       99999999-1111-2222-3333-444444444444
+:ROAM_REFS: https://example.com/article @nora2023
+:END:
+#+title: ROAM_REFS variety
+#+filetags: :literature:references:
+
+A file that defines a literature note via ROAM_REFS — both a URL and
+a citation key. find_by_ref should locate this node from either value.

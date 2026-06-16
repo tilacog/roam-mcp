@@ -1,0 +1,20 @@
+:PROPERTIES:
+:ID:       88888888-7777-6666-5555-444444444444
+:END:
+#+title: Café — Über die Größe
+
+A file with non-ASCII content in title, body, and target names.
+
+* Über die Größe
+:PROPERTIES:
+:CUSTOM_ID: über-größe
+:END:
+
+<<größen-anchor>> Deutsche Sprache, schwere Sprache: Größe, Gemütlichkeit, Schöner Schein.
+
+* 中文标题
+:PROPERTIES:
+:CUSTOM_ID: 中文
+:END:
+
+A headline with CJK in the title and custom id. Lorem ipsum dolor sit amet.

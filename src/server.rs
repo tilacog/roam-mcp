@@ -1,0 +1,1245 @@
+//! MCP server: the `RoamServer` struct, `ServerHandler` impl, tool/prompt
+//! routers, file watching, and resource subscriptions.
+//!
+//! Read-side tools are always registered. In read-only mode the write
+//! tools are removed from the tool router at construction time, so they
+//! are neither listed nor callable; the write tools additionally guard
+//! themselves at runtime for direct library callers.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+
+use rmcp::handler::server::router::prompt::PromptRouter;
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{
+    Annotated, CallToolResult, Content, GetPromptRequestParams, GetPromptResult, Implementation,
+    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+    PromptMessage, PromptMessageRole, ProtocolVersion, RawResourceTemplate,
+    ReadResourceRequestParams, ReadResourceResult, ResourceContents,
+    ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscribeRequestParams,
+    UnsubscribeRequestParams,
+};
+use rmcp::prompt;
+use rmcp::prompt_handler;
+use rmcp::prompt_router;
+use rmcp::service::{Peer, RequestContext};
+use rmcp::tool;
+use rmcp::tool_handler;
+use rmcp::tool_router;
+use rmcp::ErrorData as McpError;
+use rmcp::RoleServer;
+use rmcp::ServerHandler;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::config::Config;
+use crate::index::{NodeQuery, RoamIndex};
+use crate::sync::{DbSyncer, SyncMode};
+use crate::tools::content;
+use crate::tools::query;
+use crate::tools::sync_tool::{self, SyncBackend, SyncDatabaseParams, SyncReport};
+use crate::tools::write as write_tools;
+
+/// Subscribed peers: URI → (session id → peer). The MCP unsubscribe
+/// request only carries a URI, so peers are keyed by the session that
+/// registered them — one session unsubscribing must not evict another
+/// session's subscription to the same resource.
+type Subscriptions = Arc<Mutex<HashMap<String, HashMap<u64, Peer<RoleServer>>>>>;
+
+/// Peers (with their session ids) subscribed to one URI.
+type SessionPeers = Vec<(u64, Peer<RoleServer>)>;
+
+/// Process-wide source of session ids (see [`RoamServer::for_new_session`]).
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
+
+/// The names of the tools removed from the router in read-only mode.
+const WRITE_TOOLS: &[&str] = &[
+    "create_node",
+    "append_to_node",
+    "prepend_to_node",
+    "insert_anchor",
+    "daily_capture",
+    "update_node",
+    "delete_node",
+    "rename_node",
+    "add_link",
+];
+
+/// The org-roam MCP server.
+///
+/// Wraps a [`RoamIndex`] for metadata queries; content reads go through
+/// `tools::content` (which parses files with `org::parse::OrgDoc`).
+///
+/// The index is held behind an `RwLock` so it can be hot-reloaded: the
+/// file-watcher background task swaps it when the database (or, in
+/// scanner mode, any `.org` file) changes, and the write tools swap it
+/// after a successful write so clients immediately read their own writes.
+#[derive(Clone)]
+pub struct RoamServer {
+    pub config: Arc<Config>,
+    /// The live index. Acquired via `get_index()`.
+    index_cell: Arc<RwLock<Arc<dyn RoamIndex>>>,
+    pub tool_router: ToolRouter<Self>,
+    pub prompt_router: PromptRouter<Self>,
+    /// Subscriptions shared across sessions (the watcher notifies all).
+    subscriptions: Subscriptions,
+    /// This instance's session key into `subscriptions`.
+    session_id: u64,
+    /// Debounced `org-roam-db-sync` trigger; called after every successful write.
+    syncer: Arc<DbSyncer>,
+}
+
+/// Result of the `force:true` branch of `sync_database`, folded into the
+/// final [`SyncReport`] by `run_sync_database`.
+struct ForcedSync {
+    ok: bool,
+    did_sync: bool,
+    outcome: Option<String>,
+    job_id: Option<String>,
+    queued_at: Option<String>,
+    warnings: Vec<String>,
+}
+
+impl ForcedSync {
+    /// A neutral starting point: no sync performed yet, no error.
+    fn pending() -> Self {
+        Self {
+            ok: true,
+            did_sync: false,
+            outcome: None,
+            job_id: None,
+            queued_at: None,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+impl RoamServer {
+    /// Build a new server. Picks an index backend based on the config and
+    /// spawns the file-watcher background task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index backend cannot be opened.
+    pub fn new(config: Config) -> Result<Self, crate::index::IndexError> {
+        let index = crate::index::open(&config)?;
+        let server = Self::assemble(config, index);
+        server.spawn_watcher();
+        Ok(server)
+    }
+
+    /// Like `new` but with an explicit index (used in tests; no watcher spawned).
+    pub fn with_index(config: Config, index: Arc<dyn RoamIndex>) -> Self {
+        Self::assemble(config, index)
+    }
+
+    fn assemble(config: Config, index: Arc<dyn RoamIndex>) -> Self {
+        let syncer = DbSyncer::new(config.sync_config());
+        let mut tool_router = Self::tool_router();
+        if !config.can_write() {
+            for name in WRITE_TOOLS {
+                tool_router.remove_route(name);
+            }
+        }
+        Self {
+            config: Arc::new(config),
+            index_cell: Arc::new(RwLock::new(index)),
+            tool_router,
+            prompt_router: Self::prompt_router(),
+            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            syncer,
+        }
+    }
+
+    /// A handle for serving one more session (HTTP transport): shares the
+    /// config, index, watcher, and subscription map, but gets its own
+    /// session id so its subscriptions are tracked separately.
+    #[must_use]
+    pub fn for_new_session(&self) -> Self {
+        let mut clone = self.clone();
+        clone.session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        clone
+    }
+
+    /// Return a clone of the current index Arc, briefly holding the read lock.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the index `RwLock` is poisoned.
+    #[must_use]
+    pub fn get_index(&self) -> Arc<dyn RoamIndex> {
+        self.index_cell.read().expect("index lock poisoned").clone()
+    }
+
+    /// Rebuild the index after a successful write so the next tool call
+    /// sees the change. Only needed in scanner mode — with a database,
+    /// Emacs's `org-roam-db-sync` updates the file and the watcher
+    /// reloads from it.
+    fn refresh_index_after_write(&self) {
+        if self.config.has_db() {
+            return;
+        }
+        match crate::index::open(&self.config) {
+            Ok(idx) => *self.index_cell.write().expect("index lock poisoned") = idx,
+            Err(e) => tracing::warn!("index refresh after write failed: {e}"),
+        }
+    }
+
+    /// Force a rebuild of the filesystem-scanner index and swap it in.
+    /// Returns the rebuilt node count.
+    fn rebuild_scanner_index(&self) -> Result<usize, crate::index::IndexError> {
+        let idx = crate::index::scan::ScanIndex::open(&self.config.roam_dir)?;
+        let count = idx.node_count()?;
+        *self.index_cell.write().expect("index lock poisoned") = Arc::new(idx);
+        Ok(count)
+    }
+
+    /// Implementation of the `sync_database` tool. Reports the operational
+    /// state of the sync subsystem and the scanner-vs-sqlite drift, and —
+    /// when `force` is set — triggers a sync of the requested backend.
+    async fn run_sync_database(&self, p: SyncDatabaseParams) -> Result<SyncReport, McpError> {
+        let backend = SyncBackend::parse(p.backend.as_deref().unwrap_or("auto"))
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let cfg = &self.config;
+        let mode = self.syncer.mode().clone();
+        let start = std::time::Instant::now();
+
+        // `auto` resolves to whichever backend reads currently go through.
+        let effective = match backend {
+            SyncBackend::Auto if cfg.has_db() => SyncBackend::Sqlite,
+            SyncBackend::Auto => SyncBackend::Scanner,
+            other => other,
+        };
+
+        let forced = if p.force {
+            self.force_sync(effective, &mode, p.wait, p.timeout_ms.unwrap_or(30_000))
+                .await
+        } else {
+            ForcedSync::pending()
+        };
+
+        let (drift, drift_warnings) = sync_tool::compute_drift(cfg);
+        let mut warnings = forced.warnings;
+        warnings.extend(drift_warnings);
+
+        let state = self.syncer.state();
+        let active_backend = if cfg.has_db() { "sqlite" } else { "scanner" };
+
+        Ok(SyncReport {
+            ok: forced.ok,
+            mode: format!("{mode:?}"),
+            active_backend: active_backend.to_string(),
+            db_path: Some(cfg.db_path().display().to_string()),
+            db_exists: cfg.has_db(),
+            last_sync: state.last_sync.map(|t| t.to_rfc3339()),
+            duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            synced: forced.did_sync,
+            outcome: forced.outcome.or(state.last_outcome),
+            sync_id: forced.job_id,
+            queued_at: forced.queued_at,
+            drift,
+            warnings,
+        })
+    }
+
+    /// Perform a forced sync of the (already auto-resolved) `effective`
+    /// backend. Never returns an `Err`: failures and skips are recorded in
+    /// the returned [`ForcedSync`] so the report can still carry drift.
+    async fn force_sync(
+        &self,
+        effective: SyncBackend,
+        mode: &SyncMode,
+        wait: bool,
+        timeout_ms: u64,
+    ) -> ForcedSync {
+        let mut f = ForcedSync::pending();
+        match effective {
+            SyncBackend::Scanner => {
+                if self.config.has_db() {
+                    f.warnings.push(
+                        "rebuilt the scanner index while an org-roam.db is active; the next db \
+                         change will swap the sqlite backend back in"
+                            .to_string(),
+                    );
+                }
+                match self.rebuild_scanner_index() {
+                    Ok(_) => {
+                        f.did_sync = true;
+                        f.outcome = Some("scanner index rebuilt".to_string());
+                    }
+                    Err(e) => {
+                        f.ok = false;
+                        f.outcome = Some("scanner rebuild failed".to_string());
+                        f.warnings.push(format!("scanner rebuild failed: {e}"));
+                    }
+                }
+            }
+            SyncBackend::Sqlite if *mode == SyncMode::Never => {
+                f.warnings.push(
+                    "sync-mode is 'never'; sync_database is a no-op. Restart with \
+                     --sync-mode=client-only or --sync-mode=full to enable syncing."
+                        .to_string(),
+                );
+                f.outcome = Some("skipped — sync-mode never".to_string());
+            }
+            SyncBackend::Sqlite => {
+                if *mode == SyncMode::ClientOnly && !self.syncer.emacsclient_reachable().await {
+                    f.warnings.push(
+                        "emacsclient not reachable; a client-only sync will be skipped. Pass \
+                         backend='scanner' for a scanner rebuild, or restart with \
+                         --sync-mode=full."
+                            .to_string(),
+                    );
+                }
+                if wait {
+                    self.run_blocking_sync(&mut f, timeout_ms).await;
+                } else {
+                    f.queued_at = Some(chrono::Utc::now().to_rfc3339());
+                    let syncer_handle = Arc::clone(&self.syncer);
+                    tokio::spawn(async move {
+                        let result = syncer_handle.sync_now().await;
+                        tracing::info!("org-roam db sync (queued): {result}");
+                    });
+                    f.outcome = Some("queued".to_string());
+                    f.job_id = Some(uuid::Uuid::new_v4().to_string());
+                }
+            }
+            SyncBackend::Auto => unreachable!("auto resolved before force_sync"),
+        }
+        f
+    }
+
+    /// Run an `org-roam-db-sync` now and fold the outcome into `f`,
+    /// honoring `timeout_ms` (0 = wait indefinitely).
+    async fn run_blocking_sync(&self, f: &mut ForcedSync, timeout_ms: u64) {
+        let result = if timeout_ms == 0 {
+            Ok(self.syncer.sync_now().await)
+        } else {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                self.syncer.sync_now(),
+            )
+            .await
+        };
+        if let Ok(outcome) = result {
+            f.did_sync = outcome.synced();
+            let text = outcome.to_string();
+            // A real sync, or a coalesce onto a concurrent one, is success;
+            // anything else means we tried but could not reach Emacs.
+            if !f.did_sync && !text.contains("coalesced") {
+                f.ok = false;
+            }
+            f.outcome = Some(text);
+        } else {
+            f.ok = false;
+            f.outcome = Some("timed out".to_string());
+            f.warnings.push(format!(
+                "sync timed out after {timeout_ms} ms; it may still be running in the background"
+            ));
+        }
+    }
+
+    /// Spawn a background task that watches the roam directory and the DB file.
+    ///
+    /// - `.org` file changes → send `notifications/resources/updated` to
+    ///   subscribers; in scanner mode, also rebuild the index (external
+    ///   edits would otherwise never become visible).
+    /// - `org-roam.db` changes → reload the index.
+    fn spawn_watcher(&self) {
+        let config = self.config.clone();
+        let index_cell = self.index_cell.clone();
+        let subscriptions = self.subscriptions.clone();
+
+        tokio::spawn(async move {
+            use notify::{RecursiveMode, Watcher};
+
+            let (tx, mut rx) =
+                tokio::sync::mpsc::unbounded_channel::<notify::Result<notify::Event>>();
+            let mut watcher = match notify::recommended_watcher(move |res| {
+                let _ = tx.send(res);
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!("file watcher init failed: {e}");
+                    return;
+                }
+            };
+
+            if let Err(e) = watcher.watch(&config.roam_dir, RecursiveMode::Recursive) {
+                tracing::warn!("file watcher watch failed: {e}");
+                return;
+            }
+
+            tracing::debug!("file watcher active on {}", config.roam_dir.display());
+            let db_path = config.db_path();
+
+            while let Some(first) = rx.recv().await {
+                // Editor saves and git operations emit bursts of events;
+                // wait a beat, then drain whatever queued so the whole
+                // burst is handled with at most one index reload.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let mut batch = vec![first];
+                while let Ok(more) = rx.try_recv() {
+                    batch.push(more);
+                }
+                handle_fs_events(batch, &db_path, &config, &index_cell, &subscriptions).await;
+            }
+
+            // Keep watcher alive until the channel is closed.
+            drop(watcher);
+        });
+    }
+}
+
+fn events_to_paths(events: Vec<notify::Result<notify::Event>>) -> Vec<std::path::PathBuf> {
+    use notify::EventKind;
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    for res in events {
+        match res {
+            Ok(event) => match event.kind {
+                EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) => {
+                    paths.extend(event.paths);
+                }
+                _ => {}
+            },
+            Err(e) => tracing::warn!("watch error: {e}"),
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn maybe_reload_index(
+    paths: &[std::path::PathBuf],
+    db_path: &Path,
+    config: &Config,
+    index_cell: &Arc<RwLock<Arc<dyn RoamIndex>>>,
+) {
+    let is_org = |p: &Path| p.extension().and_then(|e| e.to_str()) == Some("org");
+    if paths
+        .iter()
+        .any(|p| p == db_path || (is_org(p) && !config.has_db()))
+    {
+        match crate::index::open(config) {
+            Ok(new_idx) => {
+                *index_cell.write().expect("index lock") = new_idx;
+                tracing::debug!("index reloaded ({} changed paths)", paths.len());
+            }
+            Err(e) => tracing::warn!("index reload failed: {e}"),
+        }
+    }
+}
+
+fn collect_to_notify(
+    path: &Path,
+    index: &Arc<dyn RoamIndex>,
+    subs_map: &HashMap<String, HashMap<u64, Peer<RoleServer>>>,
+) -> Vec<(String, SessionPeers)> {
+    let mut to_notify: Vec<(String, SessionPeers)> = Vec::new();
+    for (uri, peers) in subs_map {
+        if let Some(id) = uri
+            .strip_prefix("org-roam://node/")
+            .map(|s| s.split_once('#').map_or(s, |(id, _)| id))
+        {
+            if let Ok(Some(meta)) = index.node(id) {
+                if meta.file == *path {
+                    to_notify.push((
+                        uri.clone(),
+                        peers.iter().map(|(s, p)| (*s, p.clone())).collect(),
+                    ));
+                }
+            }
+        }
+    }
+    to_notify
+}
+
+fn remove_dead_peers_for_uri(uri: &str, dead: Vec<u64>, subscriptions: &Subscriptions) {
+    let mut subs = subscriptions.lock().expect("subscriptions lock");
+    if let Some(list) = subs.get_mut(uri) {
+        for session in dead {
+            list.remove(&session);
+        }
+        if list.is_empty() {
+            subs.remove(uri);
+        }
+    }
+}
+
+async fn dispatch_notifications(
+    to_notify: Vec<(String, SessionPeers)>,
+    subscriptions: &Subscriptions,
+) {
+    for (uri, peers) in to_notify {
+        let mut dead = Vec::new();
+        for (session, peer) in &peers {
+            let param = ResourceUpdatedNotificationParam { uri: uri.clone() };
+            if peer.notify_resource_updated(param).await.is_err() {
+                dead.push(*session);
+            }
+        }
+        if !dead.is_empty() {
+            remove_dead_peers_for_uri(&uri, dead, subscriptions);
+        }
+    }
+}
+
+async fn notify_org_path(
+    path: &Path,
+    index_cell: &Arc<RwLock<Arc<dyn RoamIndex>>>,
+    subscriptions: &Subscriptions,
+) {
+    let index = index_cell.read().expect("index lock").clone();
+    let to_notify = {
+        let subs = subscriptions.lock().expect("subscriptions lock");
+        collect_to_notify(path, &index, &subs)
+    };
+    dispatch_notifications(to_notify, subscriptions).await;
+}
+
+/// Handle a coalesced batch of filesystem events from `notify`: at most
+/// one index reload for the batch, then per-file subscriber notifications.
+async fn handle_fs_events(
+    events: Vec<notify::Result<notify::Event>>,
+    db_path: &Path,
+    config: &Config,
+    index_cell: &Arc<RwLock<Arc<dyn RoamIndex>>>,
+    subscriptions: &Subscriptions,
+) {
+    let paths = events_to_paths(events);
+    maybe_reload_index(&paths, db_path, config, index_cell);
+    let is_org = |p: &Path| p.extension().and_then(|e| e.to_str()) == Some("org");
+    for path in paths.iter().filter(|p| is_org(p)) {
+        notify_org_path(path, index_cell, subscriptions).await;
+    }
+}
+
+// ── Prompt params ─────────────────────────────────────────────────────────────
+
+/// `summarize-node` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SummarizeNodeParams {
+    /// The node's :ID:.
+    pub id: String,
+}
+
+/// `link-suggestions` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LinkSuggestionsParams {
+    /// Draft text to find link targets for.
+    pub draft: String,
+
+    /// Maximum number of candidate nodes to include. Defaults to 50.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+// ── Tool dispatch ─────────────────────────────────────────────────────────────
+
+/// `ping` — simple liveness tool. Useful for `mcp inspector` and CI.
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Default)]
+pub struct PingParams {}
+
+#[tool_router]
+impl RoamServer {
+    #[tool(description = "Liveness check; returns 'pong'.")]
+    async fn ping(&self, _p: Parameters<PingParams>) -> Result<CallToolResult, McpError> {
+        Ok(CallToolResult::success(vec![Content::text("pong")]))
+    }
+
+    #[tool(
+        description = "Information about this org-roam index: backend, file count, version, sync and dailies config."
+    )]
+    async fn server_info(&self) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        let node_count = index
+            .node_count()
+            .map_err(|e| McpError::internal_error(format!("index error: {e}"), None))?;
+        let cfg = &self.config;
+        let backend = if cfg.has_db() { "sqlite" } else { "scanner" };
+        let info = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "backend": backend,
+            "index_source": index.source(),
+            "node_count": node_count,
+            "read_only": !cfg.can_write(),
+            "roam_dir": cfg.roam_dir,
+            "db_path": cfg.db_path(),
+            "has_db": cfg.has_db(),
+            "dailies": {
+                "dir": cfg.dailies_dir,
+                "format": cfg.dailies_format,
+            },
+            "sync": {
+                "mode": format!("{:?}", cfg.sync_mode),
+                "debounce_ms": cfg.sync_debounce_ms,
+                "timeout_s": cfg.sync_timeout_s,
+                "last_sync": self.syncer.state().last_sync.map(|t| t.to_rfc3339()),
+            },
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&info).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        description = "Force a sync of org-roam.db from the on-disk vault, or report the current sync state. With force:false (default) it reports mode, active backend, last sync, and the drift between the scanner view and the sqlite view (un-synced writes show up as missing_in_sqlite). With force:true it triggers a sync of the chosen backend. In --sync-mode never it is a no-op with a warning."
+    )]
+    async fn sync_database(
+        &self,
+        p: Parameters<SyncDatabaseParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let report = self.run_sync_database(p.0).await?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&report).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(description = "Search org-roam nodes by title, alias, or tag")]
+    async fn search_nodes(
+        &self,
+        p: Parameters<query::SearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::search_nodes(&index, p)
+    }
+
+    #[tool(description = "Look up a single node by its :ID:; returns its metadata and full body")]
+    async fn get_node(
+        &self,
+        p: Parameters<query::GetNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::get_node(&index, &p)
+    }
+
+    #[tool(
+        description = "Get a sub-section of a node by anchor: CUSTOM_ID, headline title, dedicated target, or free text"
+    )]
+    async fn get_node_section(
+        &self,
+        p: Parameters<content::GetNodeSectionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        content::get_node_section(&index, &p)
+    }
+
+    #[tool(description = "List nodes that link to a given node (backlinks)")]
+    async fn get_backlinks(
+        &self,
+        p: Parameters<query::GetNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::get_backlinks(&index, &p)
+    }
+
+    #[tool(description = "List outgoing links from a node")]
+    async fn get_forward_links(
+        &self,
+        p: Parameters<query::GetNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::get_forward_links(&index, &p)
+    }
+
+    #[tool(description = "Find nodes by ROAM_REFS value (URL or @citekey)")]
+    async fn find_by_ref(
+        &self,
+        p: Parameters<query::FindByRefParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::find_by_ref(&index, &p)
+    }
+
+    #[tool(description = "List all tags and the count of nodes that have each")]
+    async fn list_tags(&self) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::list_tags(&index)
+    }
+
+    #[tool(
+        description = "Find plain-text occurrences of a node's title or aliases elsewhere in the vault (capped)"
+    )]
+    async fn unlinked_references(
+        &self,
+        p: Parameters<query::UnlinkedParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::unlinked_references(&index, &self.config.roam_dir, &p)
+    }
+
+    #[tool(
+        description = "Enumerate vault nodes with pagination (limit/offset) and sorting; returns the total count"
+    )]
+    async fn list_nodes(
+        &self,
+        p: Parameters<query::ListNodesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::list_nodes(&index, p)
+    }
+
+    #[tool(
+        description = "List notes that have no edges in the id link graph: no outgoing id: links and no incoming id: links (backlinks). These notes exist in the vault but are unreachable from any other note, so they are prime candidates for triage (merge, link, or delete). URL, file, citation, and fuzzy links do not count as edges. Returns a paginated page sorted by title (ascending by default)."
+    )]
+    async fn list_orphans(
+        &self,
+        p: Parameters<query::ListOrphansParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::list_orphans(&index, p)
+    }
+
+    #[tool(description = "Full-text search across node bodies (not just titles/aliases/tags)")]
+    async fn search_text(
+        &self,
+        p: Parameters<query::SearchTextParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::search_text(&index, &self.config.roam_dir, p)
+    }
+
+    #[tool(description = "Look up a node by its file path (absolute or relative to the roam dir)")]
+    async fn get_node_by_path(
+        &self,
+        p: Parameters<query::GetNodeByPathParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::get_node_by_path(&index, &self.config.roam_dir, &p)
+    }
+
+    #[tool(
+        description = "List the ROAM_REFS (and v1 ROAM_KEY) values a node declares; inverse of find_by_ref"
+    )]
+    async fn get_refs(
+        &self,
+        p: Parameters<query::GetNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::get_refs(&index, &p)
+    }
+
+    #[tool(
+        description = "List a node's addressable anchors: dedicated targets, headlines, and CUSTOM_IDs"
+    )]
+    async fn list_anchors(
+        &self,
+        p: Parameters<query::GetNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::list_anchors(&index, &p)
+    }
+
+    #[tool(description = "Count tags that co-occur with a given tag across the vault")]
+    async fn tag_cooccurrences(
+        &self,
+        p: Parameters<query::TagCooccurrenceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::tag_cooccurrences(&index, &p)
+    }
+
+    #[tool(
+        description = "Report structural problems with a node: stale :ID:, empty title, dangling id links"
+    )]
+    async fn validate_node(
+        &self,
+        p: Parameters<query::GetNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::validate_node(&index, &p)
+    }
+
+    #[tool(description = "Read the daily note for a date (default today) without creating it")]
+    async fn get_daily_note(
+        &self,
+        p: Parameters<write_tools::GetDailyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        write_tools::get_daily_note(&self.config, p)
+    }
+
+    #[tool(description = "List the notes in the dailies directory, newest first")]
+    async fn list_dailies(
+        &self,
+        p: Parameters<write_tools::ListDailiesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        write_tools::list_dailies(&self.config, p)
+    }
+
+    // -- Write tools (removed from the router when read-only) --
+
+    #[tool(description = "Create a new org-roam node (.org file) with a fresh :ID:")]
+    async fn create_node(
+        &self,
+        p: Parameters<write_tools::CreateNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = write_tools::create_node(&self.config, p)?;
+        self.refresh_index_after_write();
+        self.syncer.schedule();
+        Ok(result)
+    }
+
+    #[tool(
+        description = "Append content to an existing node, optionally under a specific headline"
+    )]
+    async fn append_to_node(
+        &self,
+        p: Parameters<write_tools::AppendParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        let result = write_tools::append_to_node(&self.config, &index, p)?;
+        self.refresh_index_after_write();
+        self.syncer.schedule();
+        Ok(result)
+    }
+
+    #[tool(
+        description = "Insert a dedicated target <<name>> before a matched paragraph; returns [[id:UUID::name]]"
+    )]
+    async fn insert_anchor(
+        &self,
+        p: Parameters<write_tools::InsertAnchorParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        let result = write_tools::insert_anchor(&self.config, &index, p)?;
+        self.refresh_index_after_write();
+        self.syncer.schedule();
+        Ok(result)
+    }
+
+    #[tool(
+        description = "Create or retrieve today's daily note and optionally append content to it"
+    )]
+    async fn daily_capture(
+        &self,
+        p: Parameters<write_tools::DailyCaptureParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = write_tools::daily_capture(&self.config, p)?;
+        self.refresh_index_after_write();
+        self.syncer.schedule();
+        Ok(result)
+    }
+
+    #[tool(
+        description = "Edit a file-level node's title/body/tags/aliases/refs/properties in place (idempotent, keyed on :ID:). Pass preview:true for a dry run."
+    )]
+    async fn update_node(
+        &self,
+        p: Parameters<write_tools::UpdateNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        let preview = p.0.preview;
+        let result = write_tools::update_node(&self.config, &index, p)?;
+        if !preview {
+            self.refresh_index_after_write();
+            self.syncer.schedule();
+        }
+        Ok(result)
+    }
+
+    #[tool(
+        description = "Delete a node: the whole file for a file node, or just the subtree for a headline node"
+    )]
+    async fn delete_node(
+        &self,
+        p: Parameters<write_tools::DeleteNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        let result = write_tools::delete_node(&self.config, &index, p)?;
+        self.refresh_index_after_write();
+        self.syncer.schedule();
+        Ok(result)
+    }
+
+    #[tool(
+        description = "Insert content at the start of a node's body (counterpart to append_to_node)"
+    )]
+    async fn prepend_to_node(
+        &self,
+        p: Parameters<write_tools::PrependParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        let result = write_tools::prepend_to_node(&self.config, &index, p)?;
+        self.refresh_index_after_write();
+        self.syncer.schedule();
+        Ok(result)
+    }
+
+    #[tool(
+        description = "Change a file-level node's title and rename its file to match (backlinks keyed on :ID: are unaffected)"
+    )]
+    async fn rename_node(
+        &self,
+        p: Parameters<write_tools::RenameNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        let result = write_tools::rename_node(&self.config, &index, p)?;
+        self.refresh_index_after_write();
+        self.syncer.schedule();
+        Ok(result)
+    }
+
+    #[tool(description = "Write an [[id:...]] link from one node to another; both must exist")]
+    async fn add_link(
+        &self,
+        p: Parameters<write_tools::AddLinkParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        let result = write_tools::add_link(&self.config, &index, p)?;
+        self.refresh_index_after_write();
+        self.syncer.schedule();
+        Ok(result)
+    }
+}
+
+// ── Prompt dispatch ───────────────────────────────────────────────────────────
+
+#[prompt_router]
+impl RoamServer {
+    #[prompt(
+        name = "summarize-node",
+        description = "Build a prompt asking Claude to summarize an org-roam node"
+    )]
+    async fn summarize_node(
+        &self,
+        p: Parameters<SummarizeNodeParams>,
+    ) -> Result<GetPromptResult, McpError> {
+        let index = self.get_index();
+        let body = content::read_node_body(&index, &p.0.id).map_err(McpError::from)?;
+
+        let user_text = format!(
+            "Please write a concise summary of the following org-roam note titled \"{}\".\n\n{}",
+            body.node.title, body.body
+        );
+        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            user_text,
+        )])
+        .with_description("Summarize an org-roam node"))
+    }
+
+    #[prompt(
+        name = "link-suggestions",
+        description = "Build a prompt asking Claude to suggest org-roam links for a draft text"
+    )]
+    async fn link_suggestions(
+        &self,
+        p: Parameters<LinkSuggestionsParams>,
+    ) -> Result<GetPromptResult, McpError> {
+        let index = self.get_index();
+        let limit = p.0.limit.unwrap_or(50);
+        let nodes = index
+            .find_nodes(&NodeQuery {
+                query: None,
+                tags: &[],
+                limit: Some(limit),
+            })
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let node_list = nodes
+            .iter()
+            .map(|n| format!("- [[id:{}][{}]]", n.id, n.title))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let user_text = format!(
+            "Given the draft text below, suggest which of the listed org-roam notes should be \
+             linked. Format each suggestion as [[id:UUID][Title]] with a one-sentence reason.\n\n\
+             ## Draft\n{}\n\n## Available nodes\n{}",
+            p.0.draft, node_list
+        );
+        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            user_text,
+        )])
+        .with_description("Suggest org-roam links for a draft text"))
+    }
+}
+
+// ── ServerHandler ─────────────────────────────────────────────────────────────
+
+#[tool_handler(router = self.tool_router)]
+#[prompt_handler(router = self.prompt_router)]
+impl ServerHandler for RoamServer {
+    fn get_info(&self) -> ServerInfo {
+        let caps = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .enable_resources_subscribe()
+            .enable_resources_list_changed()
+            .enable_prompts()
+            .build();
+        ServerInfo::new(caps)
+            .with_server_info(Implementation::new(
+                "org-roam-mcp",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_protocol_version(ProtocolVersion::V_2025_11_25)
+            .with_instructions(
+                "Query and extend an org-roam knowledge base. Read tools: search_nodes, \
+                 list_nodes, list_orphans, search_text, get_node, get_node_by_path, \
+                 get_node_section, get_backlinks, get_forward_links, find_by_ref, get_refs, \
+                 list_tags, tag_cooccurrences, list_anchors, unlinked_references, \
+                 validate_node, get_daily_note, list_dailies, server_info, sync_database. \
+                 Write tools (removed in --read-only): create_node, update_node, delete_node, \
+                 rename_node, append_to_node, prepend_to_node, add_link, insert_anchor, \
+                 daily_capture. Resources: org-roam://node/{id}. \
+                 Prompts: summarize-node, link-suggestions."
+                    .to_string(),
+            )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        // Resource listing is intentionally sparse: clients should use
+        // search_nodes to discover nodes, then read by URI.
+        Ok(ListResourcesResult {
+            resources: vec![],
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        let uri = request.uri;
+        let path = uri
+            .strip_prefix("org-roam://node/")
+            .ok_or_else(|| McpError::invalid_params(format!("unsupported uri: {uri}"), None))?;
+        let (id, anchor) = match path.split_once('#') {
+            Some((id, anc)) => (id, Some(anc.to_string())),
+            None => (path, None),
+        };
+        let index = self.get_index();
+        let body = content::read_node_body(&index, id).map_err(|e| match e {
+            content::NodeBodyError::NotFound(_) => {
+                McpError::resource_not_found(e.to_string(), None)
+            }
+            _ => McpError::internal_error(e.to_string(), None),
+        })?;
+        let text = if let Some(anc) = anchor {
+            let doc = crate::org::OrgDoc::from_text(body.body);
+            let section = crate::org::AnchorResolver::resolve(&doc, &anc).ok_or_else(|| {
+                McpError::resource_not_found(format!("anchor not found: {anc}"), None)
+            })?;
+            section.text
+        } else {
+            body.body
+        };
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            text, uri,
+        )]))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        let template = Annotated::<RawResourceTemplate> {
+            raw: RawResourceTemplate {
+                uri_template: "org-roam://node/{id}".to_string(),
+                name: "Org-roam node".to_string(),
+                title: None,
+                description: Some(
+                    "Full body of an org-roam node. Add #anchor for a sub-section.".to_string(),
+                ),
+                mime_type: Some("text/org".to_string()),
+                icons: None,
+            },
+            annotations: None,
+        };
+        Ok(ListResourceTemplatesResult {
+            resource_templates: vec![template],
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        let uri = request.uri;
+        tracing::debug!("subscribe: {uri} (session {})", self.session_id);
+        self.subscriptions
+            .lock()
+            .expect("subscriptions lock")
+            .entry(uri)
+            .or_default()
+            .insert(self.session_id, ctx.peer);
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        tracing::debug!("unsubscribe: {} (session {})", request.uri, self.session_id);
+        let mut subs = self.subscriptions.lock().expect("subscriptions lock");
+        if let Some(list) = subs.get_mut(&request.uri) {
+            list.remove(&self.session_id);
+            if list.is_empty() {
+                subs.remove(&request.uri);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, RwLock};
+    use tempfile::TempDir;
+
+    fn scanner_config(dir: &std::path::Path) -> Config {
+        Config::from_args(dir, true, true, None).expect("scanner config")
+    }
+
+    fn make_index_cell(dir: &std::path::Path) -> Arc<RwLock<Arc<dyn RoamIndex>>> {
+        let idx = crate::index::scan::ScanIndex::open(dir).expect("scan index");
+        Arc::new(RwLock::new(Arc::new(idx) as Arc<dyn RoamIndex>))
+    }
+
+    // --- maybe_reload_index ---
+
+    #[test]
+    fn reload_skipped_for_empty_paths() {
+        let dir = TempDir::new().unwrap();
+        let config = scanner_config(dir.path());
+        let db_path = config.db_path();
+        let index_cell = make_index_cell(dir.path());
+        let before_ptr = Arc::as_ptr(&*index_cell.read().unwrap());
+        maybe_reload_index(&[], &db_path, &config, &index_cell);
+        let after_ptr = Arc::as_ptr(&*index_cell.read().unwrap());
+        assert_eq!(before_ptr, after_ptr, "no reload for empty paths");
+    }
+
+    #[test]
+    fn reload_triggered_by_org_path_in_scanner_mode() {
+        let dir = TempDir::new().unwrap();
+        let config = scanner_config(dir.path());
+        let db_path = config.db_path();
+        let index_cell = make_index_cell(dir.path());
+        assert_eq!(index_cell.read().unwrap().node_count().unwrap(), 0);
+        // Add an org file after building the initial (empty) index.
+        let org_path = dir.path().join("new.org");
+        std::fs::write(
+            &org_path,
+            ":PROPERTIES:\n:ID: deadbeef-dead-beef-dead-beefdeadbeef\n:END:\n#+title: New\n",
+        )
+        .unwrap();
+        maybe_reload_index(&[org_path], &db_path, &config, &index_cell);
+        assert_eq!(index_cell.read().unwrap().node_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn reload_skipped_for_non_org_path_in_scanner_mode() {
+        let dir = TempDir::new().unwrap();
+        let config = scanner_config(dir.path());
+        let db_path = config.db_path();
+        let index_cell = make_index_cell(dir.path());
+        let txt_path = dir.path().join("readme.txt");
+        std::fs::write(&txt_path, "not org").unwrap();
+        maybe_reload_index(&[txt_path], &db_path, &config, &index_cell);
+        assert_eq!(index_cell.read().unwrap().node_count().unwrap(), 0);
+    }
+
+    // --- events_to_paths ---
+
+    #[test]
+    fn events_to_paths_keeps_modify_and_dedupes() {
+        let p1 = std::path::PathBuf::from("/tmp/a.org");
+        let p2 = std::path::PathBuf::from("/tmp/b.org");
+        let events: Vec<notify::Result<notify::Event>> = vec![
+            Ok(notify::Event {
+                kind: notify::EventKind::Modify(notify::event::ModifyKind::Any),
+                paths: vec![p1.clone(), p2.clone()],
+                attrs: notify::event::EventAttributes::default(),
+            }),
+            Ok(notify::Event {
+                kind: notify::EventKind::Modify(notify::event::ModifyKind::Any),
+                paths: vec![p1.clone()],
+                attrs: notify::event::EventAttributes::default(),
+            }),
+            Ok(notify::Event {
+                kind: notify::EventKind::Access(notify::event::AccessKind::Any),
+                paths: vec![std::path::PathBuf::from("/tmp/ignored.org")],
+                attrs: notify::event::EventAttributes::default(),
+            }),
+            Err(notify::Error::generic("watch error")),
+        ];
+        let mut result = events_to_paths(events);
+        result.sort();
+        assert_eq!(result, vec![p1, p2]);
+    }
+
+    #[test]
+    fn events_to_paths_includes_create_and_remove() {
+        let p_create = std::path::PathBuf::from("/tmp/new.org");
+        let p_remove = std::path::PathBuf::from("/tmp/old.org");
+        let events: Vec<notify::Result<notify::Event>> = vec![
+            Ok(notify::Event {
+                kind: notify::EventKind::Create(notify::event::CreateKind::Any),
+                paths: vec![p_create.clone()],
+                attrs: notify::event::EventAttributes::default(),
+            }),
+            Ok(notify::Event {
+                kind: notify::EventKind::Remove(notify::event::RemoveKind::Any),
+                paths: vec![p_remove.clone()],
+                attrs: notify::event::EventAttributes::default(),
+            }),
+        ];
+        let mut result = events_to_paths(events);
+        result.sort();
+        assert_eq!(result, vec![p_create, p_remove]);
+    }
+
+    // --- collect_to_notify ---
+
+    #[test]
+    fn collect_empty_subs_yields_nothing() {
+        let dir = TempDir::new().unwrap();
+        let index_cell = make_index_cell(dir.path());
+        let index = index_cell.read().unwrap().clone();
+        let subs_map: HashMap<String, HashMap<u64, Peer<RoleServer>>> = HashMap::new();
+        let result = collect_to_notify(dir.path(), &index, &subs_map);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn collect_non_roam_uri_yields_nothing() {
+        let dir = TempDir::new().unwrap();
+        let index_cell = make_index_cell(dir.path());
+        let index = index_cell.read().unwrap().clone();
+        let mut subs_map: HashMap<String, HashMap<u64, Peer<RoleServer>>> = HashMap::new();
+        subs_map.insert("other://node/xyz".to_string(), HashMap::new());
+        let result = collect_to_notify(dir.path(), &index, &subs_map);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn collect_roam_uri_but_unknown_node_yields_nothing() {
+        let dir = TempDir::new().unwrap();
+        let index_cell = make_index_cell(dir.path());
+        let index = index_cell.read().unwrap().clone();
+        let mut subs_map: HashMap<String, HashMap<u64, Peer<RoleServer>>> = HashMap::new();
+        subs_map.insert("org-roam://node/no-such-id".to_string(), HashMap::new());
+        let result = collect_to_notify(dir.path(), &index, &subs_map);
+        assert!(result.is_empty());
+    }
+}

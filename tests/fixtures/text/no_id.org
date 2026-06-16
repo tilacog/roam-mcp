@@ -1,0 +1,11 @@
+#+title: A note without an ID
+
+This file has no :ID: anywhere — neither at the file level nor on any
+headline. The scanner should ignore it entirely, since there is no node
+to associate it with.
+
+* Still no id
+
+* No id here either
+
+Lorem ipsum dolor sit amet.

@@ -1,0 +1,56 @@
+:PROPERTIES:
+:ID:       ffffffff-ffff-ffff-ffff-ffffffffffff
+:END:
+#+title: Anchor playground
+
+A file that exercises every anchor type: `<<dedicated target>>`,
+`<<<radio target>>>`, `CUSTOM_ID`, headline title, and free-text search.
+
+* First section
+
+<<named-target>> The named target sits before the paragraph it labels.
+
+Body after named target — lorem ipsum dolor sit amet.
+
+* Second section
+:PROPERTIES:
+:CUSTOM_ID: second
+:END:
+
+The second section's body. The CUSTOM_ID property "second" is the
+canonical anchor for this headline.
+
+* Third section with code
+
+#+BEGIN_SRC rust
+fn main() {           (ref:entry)
+    println!("source block");
+}
+#+END_SRC
+
+Source blocks are not anchors, but text *inside* them can still be
+searched.
+
+* Fourth section with radio target
+
+<<<on-every-occurrence>>> This paragraph follows the radio target.
+The radio target is file-local: it points every literal occurrence
+of the term at this definition.
+
+* Fifth section with named table
+
+#+NAME: growth-table
+| year | nodes |
+|------+-------|
+| 2023 | 1     |
+| 2024 | 2     |
+
+See [[growth-table]] for the data.
+
+The text[fn:1] refers to a footnote.
+
+The text[fn:side-note] also refers to a named footnote.
+
+[fn:1] This is the footnote body.
+
+[fn:side-note] A named footnote body, used for cross-references.

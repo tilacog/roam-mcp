@@ -1,0 +1,7 @@
+:PROPERTIES:
+:ID:       aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+:ROAM_ALIASES: "The Shepherd Psalm" "Psalm 23"
+:END:
+#+title: Psalm 23
+
+The Lord is my shepherd; I shall not want.
