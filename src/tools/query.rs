@@ -655,64 +655,6 @@ pub fn tag_cooccurrences(
     Ok(json_result(&payload))
 }
 
-/// `validate_node` — report structural problems with a node: a `:ID:` the
-/// index knows but the file no longer carries (a stale index entry), an
-/// empty title, or `id:` links pointing at nodes that do not exist.
-///
-/// # Errors
-///
-/// Returns an error if the node is not found or the index query fails.
-pub fn validate_node(
-    index: &Arc<dyn RoamIndex>,
-    p: &Parameters<GetNodeParams>,
-) -> Result<CallToolResult, McpError> {
-    let id = &p.0.id;
-    let node = index
-        .node(id)
-        .map_err(internal)?
-        .ok_or_else(|| McpError::invalid_params("node not found", None))?;
-
-    let mut issues: Vec<String> = Vec::new();
-    let doc = OrgDoc::from_file(&node.file).map_err(internal)?;
-    let id_in_file = if node.is_file() {
-        doc.document()
-            .properties()
-            .and_then(|props| props.get("ID"))
-            .is_some_and(|v| v.trim() == id.as_str())
-    } else {
-        doc.headline_by_id(id).is_some()
-    };
-    if !id_in_file {
-        issues
-            .push("index references this :ID: but it is no longer present in the file".to_string());
-    }
-    if node.title.trim().is_empty() {
-        issues.push("node has an empty title".to_string());
-    }
-
-    let mut dangling: Vec<String> = Vec::new();
-    for l in index.forward_links(id).map_err(internal)? {
-        if l.kind == "id" {
-            if let Some(dest) = &l.dest {
-                if index.node(dest).map_err(internal)?.is_none() {
-                    dangling.push(dest.clone());
-                }
-            }
-        }
-    }
-    if !dangling.is_empty() {
-        issues.push(format!("{} dangling id link(s)", dangling.len()));
-    }
-
-    let payload = serde_json::json!({
-        "id": id,
-        "ok": issues.is_empty(),
-        "issues": issues,
-        "dangling_links": dangling,
-    });
-    Ok(json_result(&payload))
-}
-
 /// Dedicated targets `<<name>>` in `text` (excluding radio targets
 /// `<<<name>>>`), in document order, de-duplicated.
 fn dedicated_targets(text: &str) -> Vec<String> {

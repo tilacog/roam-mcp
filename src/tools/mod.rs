@@ -8,4 +8,5 @@
 pub mod content;
 pub mod query;
 pub mod sync_tool;
+pub mod validation_tools;
 pub mod write;

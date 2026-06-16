@@ -26,6 +26,7 @@ use crate::config::Config;
 use crate::index::RoamIndex;
 use crate::org::{edit, OrgDoc};
 use crate::util::{atomic_write, default_filename, remove_file_unlocked, rename_unlocked, slugify};
+use crate::validation;
 
 /// `create_node` parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -214,6 +215,20 @@ pub fn create_node(
                 body.push('\n');
             }
         }
+    }
+
+    // Self-check: the body is built from the params, so this should never
+    // fail. If it does, that's a bug in the synthesis code above — surface
+    // it as an internal error rather than a user-facing validation error.
+    let report = validation::validate_node_source(&body);
+    if !report.is_ok() {
+        return Err(McpError::internal_error(
+            format!(
+                "create_node produced an invalid org file: {:#?}",
+                report.issues
+            ),
+            None,
+        ));
     }
 
     atomic_write(&path, &body).map_err(|e| {
@@ -484,16 +499,42 @@ pub fn update_node(
         })?;
         let mut updated = original.clone();
         apply_node_edits(&mut updated, &p)?;
+        let report = validation::validate_node_source(&updated);
         let payload = serde_json::json!({
             "id": p.id,
             "file": node.file,
             "changed": original != updated,
+            "valid": report.is_ok(),
+            "issues": report.issues,
             "preview": updated,
         });
         return Ok(json_result(&payload));
     }
 
-    rewrite_file(&node.file, |text| apply_node_edits(text, &p))?;
+    // Validate-before-write: read the file, apply the edits in-memory,
+    // run the resulting text through the validator, and refuse the write
+    // if it would produce an invalid node. The actual write goes through
+    // `atomic_write` (sibling temp + rename) so the Emacs lockfile check
+    // and atomic-rename semantics are preserved.
+    let original = std::fs::read_to_string(&node.file).map_err(|e| {
+        McpError::internal_error(format!("reading {}: {e}", node.file.display()), None)
+    })?;
+    let mut updated = original.clone();
+    apply_node_edits(&mut updated, &p)?;
+    let report = validation::validate_node_source(&updated);
+    if !report.is_ok() {
+        let result = rmcp::model::CallToolResult::structured_error(serde_json::json!({
+            "id": p.id,
+            "file": node.file,
+            "ok": false,
+            "issues": report.issues,
+            "message": "update_node refused: the resulting file would not be a valid org-roam node",
+        }));
+        return Ok(result);
+    }
+    atomic_write(&node.file, &updated).map_err(|e| {
+        McpError::internal_error(format!("writing {}: {e}", node.file.display()), None)
+    })?;
     let payload = serde_json::json!({ "id": p.id, "file": node.file, "updated": true });
     Ok(json_result(&payload))
 }

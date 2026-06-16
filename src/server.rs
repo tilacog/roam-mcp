@@ -41,6 +41,7 @@ use crate::sync::{DbSyncer, SyncMode};
 use crate::tools::content;
 use crate::tools::query;
 use crate::tools::sync_tool::{self, SyncBackend, SyncDatabaseParams, SyncReport};
+use crate::tools::validation_tools;
 use crate::tools::write as write_tools;
 
 /// Subscribed peers: URI → (session id → peer). The MCP unsubscribe
@@ -745,14 +746,24 @@ impl RoamServer {
     }
 
     #[tool(
-        description = "Report structural problems with a node: stale :ID:, empty title, dangling id links"
+        description = "Validate a node. Pass `body` (raw org text) to check the source against the org-roam spec (returned issues include line/column). Pass `id` to check an existing node against the index (stale :ID:, empty title, dangling id links)."
     )]
     async fn validate_node(
         &self,
-        p: Parameters<query::GetNodeParams>,
+        p: Parameters<validation_tools::ValidateNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         let index = self.get_index();
-        query::validate_node(&index, &p)
+        validation_tools::validate_node(&index, &p)
+    }
+
+    #[tool(
+        description = "Walk every .org file in the vault and return a flat list of validation issues. Read-only."
+    )]
+    async fn find_invalid_nodes(
+        &self,
+        p: Parameters<validation_tools::FindInvalidNodesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        validation_tools::find_invalid_nodes(&self.config, &p)
     }
 
     #[tool(description = "Read the daily note for a date (default today) without creating it")]
