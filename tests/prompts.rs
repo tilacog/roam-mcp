@@ -260,3 +260,51 @@ async fn tag_suggestions_shows_vocabulary_current_tags_and_body() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn completion_suggests_node_ids_for_id_argument() {
+    run_with_server(server(), |peer| async move {
+        // Typing part of a title resolves to the matching node's id, so a
+        // user need not know the UUID up front.
+        let by_title = peer
+            .complete_prompt_simple("summarize-node", "id", "canticle")
+            .await
+            .expect("complete by title");
+        assert!(
+            by_title.contains(&"11111111-1111-1111-1111-111111111111".to_string()),
+            "title 'canticle' should resolve to its node id, got: {by_title:?}"
+        );
+        assert!(
+            !by_title.contains(&"22222222-2222-2222-2222-222222222222".to_string()),
+            "unrelated node must not be suggested, got: {by_title:?}"
+        );
+
+        // An id prefix also matches.
+        let by_prefix = peer
+            .complete_prompt_simple("tag-suggestions", "id", "22222222")
+            .await
+            .expect("complete by id prefix");
+        assert!(
+            by_prefix.contains(&"22222222-2222-2222-2222-222222222222".to_string()),
+            "id prefix should match, got: {by_prefix:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn completion_is_empty_for_freeform_arguments() {
+    run_with_server(server(), |peer| async move {
+        // `draft` is freeform prose — there is nothing meaningful to
+        // complete, so the server returns no suggestions.
+        let values = peer
+            .complete_prompt_simple("link-suggestions", "draft", "anything")
+            .await
+            .expect("complete draft");
+        assert!(
+            values.is_empty(),
+            "freeform argument should yield no completions, got: {values:?}"
+        );
+    })
+    .await;
+}

@@ -494,6 +494,11 @@ text) to get just the matching sub-section.
   tags, and the vault's existing tag vocabulary, and asks the model to
   propose tags that stay consistent with that vocabulary.
 
+The `id` argument of `summarize-node` and `tag-suggestions` supports
+argument completion (`completion/complete`): type part of a node's title,
+alias, or id and the server suggests matching node ids, so you don't have
+to know the UUID up front.
+
 ---
 
 ## How a write actually lands

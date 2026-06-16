@@ -15,12 +15,12 @@ use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    Annotated, CallToolResult, Content, GetPromptRequestParams, GetPromptResult, Implementation,
-    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
-    PromptMessage, PromptMessageRole, ProtocolVersion, RawResourceTemplate,
-    ReadResourceRequestParams, ReadResourceResult, ResourceContents,
-    ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscribeRequestParams,
-    UnsubscribeRequestParams,
+    Annotated, CallToolResult, CompleteRequestParams, CompleteResult, CompletionInfo, Content,
+    GetPromptRequestParams, GetPromptResult, Implementation, ListPromptsResult,
+    ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams, PromptMessage,
+    PromptMessageRole, ProtocolVersion, RawResourceTemplate, ReadResourceRequestParams,
+    ReadResourceResult, Reference, ResourceContents, ResourceUpdatedNotificationParam,
+    ServerCapabilities, ServerInfo, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::prompt;
 use rmcp::prompt_handler;
@@ -36,7 +36,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::index::{NodeMeta, RoamIndex};
+use crate::index::{NodeMeta, NodeQuery, RoamIndex};
 use crate::sync::{DbSyncer, SyncMode};
 use crate::tools::content;
 use crate::tools::query;
@@ -605,6 +605,36 @@ fn node_bullet(node: &NodeMeta) -> String {
             node.title,
             node.tags.join(", ")
         )
+    }
+}
+
+/// Completion suggestions for a prompt's `id` argument: node ids whose id
+/// prefix-matches `value`, or whose title/aliases contain it (both
+/// case-insensitive). An empty `value` matches every node. Capped at
+/// [`CompletionInfo::MAX_VALUES`], with `total`/`has_more` reported so the
+/// client knows when the list was clipped.
+fn node_id_completions(index: &Arc<dyn RoamIndex>, value: &str) -> CompletionInfo {
+    let Ok(nodes) = index.find_nodes(&NodeQuery::default()) else {
+        return CompletionInfo::default();
+    };
+    let needle = value.to_lowercase();
+    let mut values: Vec<String> = nodes
+        .into_iter()
+        .filter(|n| {
+            needle.is_empty()
+                || n.id.to_lowercase().starts_with(&needle)
+                || n.title.to_lowercase().contains(&needle)
+                || n.aliases.iter().any(|a| a.to_lowercase().contains(&needle))
+        })
+        .map(|n| n.id)
+        .collect();
+    let total = u32::try_from(values.len()).unwrap_or(u32::MAX);
+    let has_more = values.len() > CompletionInfo::MAX_VALUES;
+    values.truncate(CompletionInfo::MAX_VALUES);
+    CompletionInfo {
+        values,
+        total: Some(total),
+        has_more: Some(has_more),
     }
 }
 
@@ -1191,6 +1221,7 @@ impl ServerHandler for RoamServer {
             .enable_resources_subscribe()
             .enable_resources_list_changed()
             .enable_prompts()
+            .enable_completions()
             .build();
         ServerInfo::new(caps)
             .with_server_info(Implementation::new(
@@ -1210,6 +1241,24 @@ impl ServerHandler for RoamServer {
                  Prompts: summarize-node, link-suggestions, orphan-triage, tag-suggestions."
                     .to_string(),
             )
+    }
+
+    async fn complete(
+        &self,
+        request: CompleteRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, McpError> {
+        // The only argument with a discoverable value space is a prompt's
+        // `id` (summarize-node, tag-suggestions): the vault's node ids.
+        // Everything else (draft, limit, resource refs) yields nothing.
+        let completion = match (&request.r#ref, request.argument.name.as_str()) {
+            (Reference::Prompt(_), "id") => {
+                let index = self.get_index();
+                node_id_completions(&index, &request.argument.value)
+            }
+            _ => CompletionInfo::default(),
+        };
+        Ok(CompleteResult::new(completion))
     }
 
     async fn list_resources(
