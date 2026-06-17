@@ -50,6 +50,12 @@ cargo build --release
 claude mcp add org-roam -- /absolute/path/to/org-roam-mcp --roam-dir /absolute/path/to/your/roam
 ```
 
+A Claude Code skill lives at `.claude/skills/org-roam-kb/` in this repo. It teaches the agent how to search, navigate, and write to the vault efficiently. To install it, symlink the directory into your skills folder:
+
+```bash
+ln -s /path/to/org-roam-mcp/.claude/skills/org-roam-kb ~/.claude/skills/org-roam-kb
+```
+
 ## CLI
 
 ```
