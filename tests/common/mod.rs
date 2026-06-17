@@ -17,6 +17,20 @@ pub fn text_of(call: &rmcp::model::CallToolResult) -> String {
         .join("\n")
 }
 
+/// Collect the text content of a prompt result's messages.
+#[allow(dead_code)]
+pub fn prompt_text(result: &rmcp::model::GetPromptResult) -> String {
+    result
+        .messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            rmcp::model::PromptMessageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Serve `server` in-process and run `test_fn` against it as a client.
 ///
 /// Panics from `test_fn` (and timeouts) propagate and fail the test —

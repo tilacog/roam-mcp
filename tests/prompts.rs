@@ -9,11 +9,11 @@ mod common;
 
 use std::path::PathBuf;
 
-use rmcp::model::{GetPromptRequestParams, GetPromptResult, PromptMessageContent};
+use rmcp::model::GetPromptRequestParams;
 use rmcp::object;
 use tempfile::TempDir;
 
-use common::run_with_server;
+use common::{prompt_text, run_with_server};
 use org_roam_mcp::{Config, RoamServer};
 
 fn fixture_dir() -> PathBuf {
@@ -26,19 +26,6 @@ fn fixture_dir() -> PathBuf {
 fn server() -> RoamServer {
     let cfg = Config::from_args(&fixture_dir(), true, true, None).unwrap();
     RoamServer::new(cfg).unwrap()
-}
-
-/// Concatenate the text content of a prompt result's messages.
-fn prompt_text(result: &GetPromptResult) -> String {
-    result
-        .messages
-        .iter()
-        .filter_map(|m| match &m.content {
-            PromptMessageContent::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[tokio::test]

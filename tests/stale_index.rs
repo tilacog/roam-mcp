@@ -10,13 +10,11 @@ mod common;
 
 use std::sync::Arc;
 
-use rmcp::model::{
-    CallToolRequestParams, GetPromptRequestParams, GetPromptResult, PromptMessageContent,
-};
+use rmcp::model::{CallToolRequestParams, GetPromptRequestParams};
 use rmcp::object;
 use tempfile::TempDir;
 
-use common::{run_with_server, text_of};
+use common::{prompt_text, run_with_server, text_of};
 use org_roam_mcp::index::{IndexResult, LinkRecord, NodeMeta, NodeQuery, RoamIndex};
 use org_roam_mcp::{Config, RoamServer};
 
@@ -82,18 +80,6 @@ fn stale_server(dir: &TempDir) -> RoamServer {
     };
     let cfg = Config::from_args(dir.path(), true, true, None).unwrap();
     RoamServer::with_index(cfg, Arc::new(StaleIndex { meta }))
-}
-
-fn prompt_text(result: &GetPromptResult) -> String {
-    result
-        .messages
-        .iter()
-        .filter_map(|m| match &m.content {
-            PromptMessageContent::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[tokio::test]
