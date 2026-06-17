@@ -14,9 +14,10 @@ traps that have cost time.
 
 ## 1. What this project is
 
-- A **library-first** Rust crate (`org_roam_mcp`) with a thin CLI binary
-  (`src/main.rs`) that wires it to stdio or streamable HTTP.
-- It exposes ~25 MCP tools (read, write, prompts, resources) over a
+- A **library-first** Rust crate (`org_roam_mcp`) with two binaries:
+  - `src/main.rs` — MCP server, wires the library to stdio or streamable HTTP.
+  - `src/bin/cli.rs` — `org-roam-cli` companion, calls the same library code for testing without an MCP client.
+- It exposes ~28 MCP tools (read, write, prompts, resources) over a
   JSON-RPC transport. Default transport is stdio.
 - The data layer has **two interchangeable index backends** behind a
   shared trait (`src/index/mod.rs`):
@@ -34,7 +35,9 @@ traps that have cost time.
 
 ```
 src/
-├── main.rs        # CLI (clap), transport selection
+├── main.rs        # MCP server: CLI (clap), transport selection
+├── bin/
+│   └── cli.rs     # org-roam-cli companion binary
 ├── lib.rs         # re-exports
 ├── server.rs      # RoamServer: tool/prompt routers + file watcher
 ├── config.rs      # runtime configuration
@@ -87,6 +90,11 @@ Rules enforced by `just ci`:
   - anything that writes files → `tools/write.rs`
   Then wire the handler in `src/server.rs` (the `#[tool_router]` /
   `#[tool_handler]`-decorated impl block).
+  If the tool is useful from the command line, add a matching subcommand
+  to `src/bin/cli.rs` and a `cmd_*` dispatch function.
+- `search_nodes` uses a tiered fuzzy scorer (`fuzzy_score` in
+  `tools/query.rs`): exact → prefix → substring → subsequence with
+  density bonus. Keep these tiers in sync if you change matching logic.
 - `org-roam.db` is opened **read-only** (`SQLITE_OPEN_READ_ONLY` +
   `PRAGMA query_only = 1`). `SQLITE_BUSY` is retried with backoff.
   Do not change this — writes to the DB must go through the file layer
@@ -161,6 +169,12 @@ debugging time; the next agent should not have to re-learn them.
   mode it stays available read-only. Don't conflate "no writes to
   files" with "no side effects" — db-sync can still touch
   `org-roam.db` and require `emacsclient` reachability.
+- **CRAP gate and the CLI binary.** `src/bin/cli.rs` has 0% test
+  coverage. CRAP = CC × (CC + 1) for uncovered functions, so every
+  function must have CC ≤ 5. The `dispatch` function in `cli.rs` is
+  split into four `try_dispatch_*` helpers (max 3 handled arms +
+  wildcard each) for exactly this reason. Follow that pattern when
+  adding new subcommands.
 - **`--read-only` removes write tools from the router entirely.**
   They are not listed, not callable, not stubbed. A client that asks
   for `create_node` in read-only mode will get a "tool not found"
