@@ -881,6 +881,39 @@ impl RoamServer {
         validation_tools::find_invalid_nodes(&self.config, &p)
     }
 
+    #[tool(
+        description = "List org-roam nodes that have a TODO keyword. Optionally filter by state (e.g. [\"TODO\",\"IN-PROGRESS\"]), priority (\"A\"/\"B\"/\"C\"), and tags. Supports pagination and sort by title or priority."
+    )]
+    async fn list_tasks(
+        &self,
+        p: Parameters<query::ListTasksParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::list_tasks(&index, p)
+    }
+
+    #[tool(
+        description = "Return the hierarchical heading outline of the file that contains a given node. Includes every headline's level, TODO state, priority, and tags."
+    )]
+    async fn get_outline(
+        &self,
+        p: Parameters<query::GetOutlineParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::get_outline(&index, &p)
+    }
+
+    #[tool(
+        description = "List every .org file in the vault regardless of whether it has a file-level :ID:. Each entry includes path, size, mtime, and the node ID/title if known."
+    )]
+    async fn list_files(
+        &self,
+        p: Parameters<query::ListFilesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::list_files(&index, &self.config.roam_dir, p)
+    }
+
     #[tool(description = "Read the daily note for a date (default today) without creating it")]
     async fn get_daily_note(
         &self,
@@ -1278,10 +1311,25 @@ impl ServerHandler for RoamServer {
         _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        // Resource listing is intentionally sparse: clients should use
-        // search_nodes to discover nodes, then read by URI.
+        use rmcp::model::{Annotated, RawResource};
+        let vault = Annotated::<RawResource> {
+            raw: RawResource {
+                uri: "org-roam://vault/".to_string(),
+                name: "Vault index".to_string(),
+                title: None,
+                description: Some(
+                    "JSON summary of this org-roam vault: node count, tag count, and roam_dir."
+                        .to_string(),
+                ),
+                mime_type: Some("application/json".to_string()),
+                size: None,
+                icons: None,
+                meta: None,
+            },
+            annotations: None,
+        };
         Ok(ListResourcesResult {
-            resources: vec![],
+            resources: vec![vault],
             next_cursor: None,
             meta: None,
         })
@@ -1292,7 +1340,26 @@ impl ServerHandler for RoamServer {
         request: ReadResourceRequestParams,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
-        let uri = request.uri;
+        let uri = request.uri.clone();
+
+        // org-roam://vault/ — lightweight vault summary.
+        if uri == "org-roam://vault/" {
+            let index = self.get_index();
+            let node_count = index.node_count().unwrap_or(0);
+            let tag_count = index.tags().map_or(0, |t| t.len());
+            let summary = serde_json::json!({
+                "roam_dir": self.config.roam_dir,
+                "node_count": node_count,
+                "tag_count": tag_count,
+                "backend": index.source(),
+            });
+            return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                serde_json::to_string_pretty(&summary).unwrap_or_default(),
+                uri,
+            )]));
+        }
+
+        // org-roam://node/{id}[#anchor]
         let path = uri
             .strip_prefix("org-roam://node/")
             .ok_or_else(|| McpError::invalid_params(format!("unsupported uri: {uri}"), None))?;

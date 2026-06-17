@@ -15,6 +15,7 @@ use crate::index::scan::{keyword_values, parse_string_list};
 use crate::index::{NodeMeta, NodeQuery, RoamIndex};
 use crate::org::OrgDoc;
 use crate::tools::content::read_node_body;
+use orgize::ast::Headline as OrgHeadline;
 
 /// `search_nodes` parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
@@ -138,13 +139,53 @@ pub fn search_nodes(
 ) -> Result<CallToolResult, McpError> {
     let p = p.0;
     let limit = p.limit.unwrap_or(50);
-    let q = NodeQuery {
-        query: p.query.as_deref(),
-        tags: &p.tags,
-        limit: Some(limit),
-    };
-    let nodes = index.find_nodes(&q).map_err(internal)?;
-    Ok(render_node_list(&nodes))
+
+    if let Some(query) = &p.query {
+        // Fetch all nodes matching the tag filter, then score and sort by
+        // fuzzy relevance so "ztlk" can surface "Zettelkasten".
+        let q = NodeQuery {
+            query: None,
+            tags: &p.tags,
+            limit: None,
+        };
+        let nodes = index.find_nodes(&q).map_err(internal)?;
+        let q_lower = query.to_lowercase();
+        let mut scored: Vec<(u32, NodeMeta)> = nodes
+            .into_iter()
+            .filter_map(|n| {
+                let title_score = fuzzy_score(&q_lower, &n.title.to_lowercase());
+                let alias_score = n
+                    .aliases
+                    .iter()
+                    .map(|a| fuzzy_score(&q_lower, &a.to_lowercase()))
+                    .max()
+                    .unwrap_or(0);
+                let tag_score = n
+                    .tags
+                    .iter()
+                    .map(|t| fuzzy_score(&q_lower, &t.to_lowercase()))
+                    .max()
+                    .unwrap_or(0);
+                let score = title_score.max(alias_score).max(tag_score);
+                if score > 0 {
+                    Some((score, n))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.title.cmp(&b.1.title)));
+        let nodes: Vec<NodeMeta> = scored.into_iter().take(limit).map(|(_, n)| n).collect();
+        Ok(render_node_list(&nodes))
+    } else {
+        let q = NodeQuery {
+            query: None,
+            tags: &p.tags,
+            limit: Some(limit),
+        };
+        let nodes = index.find_nodes(&q).map_err(internal)?;
+        Ok(render_node_list(&nodes))
+    }
 }
 
 /// `get_node` — return node metadata plus its `body`: the whole file for
@@ -660,6 +701,349 @@ pub fn tag_cooccurrences(
         "cooccurring": cooccurring,
     });
     Ok(json_result(&payload))
+}
+
+// ── list_tasks ────────────────────────────────────────────────────────────────
+
+/// `list_tasks` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct ListTasksParams {
+    /// Filter to specific TODO state keywords (e.g. `["TODO", "IN-PROGRESS"]`).
+    /// Empty list means any node with a TODO state.
+    #[serde(default)]
+    pub todo_states: Vec<String>,
+
+    /// Filter by priority letter: "A", "B", or "C".
+    #[serde(default)]
+    pub priority: Option<String>,
+
+    /// Optional list of tags; the result must bear all of them.
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    /// Page size. Defaults to 50.
+    #[serde(default)]
+    pub limit: Option<usize>,
+
+    /// Number of nodes to skip before the page. Defaults to 0.
+    #[serde(default)]
+    pub offset: Option<usize>,
+
+    /// Sort order: `"title"` (default), `"title_desc"`, or `"priority"`.
+    #[serde(default)]
+    pub sort: Option<String>,
+}
+
+/// `list_tasks` — enumerate nodes that carry a TODO keyword, with optional
+/// filtering by state, priority, and tags.
+///
+/// # Errors
+///
+/// Returns an error if the index query fails.
+pub fn list_tasks(
+    index: &Arc<dyn RoamIndex>,
+    p: Parameters<ListTasksParams>,
+) -> Result<CallToolResult, McpError> {
+    let p = p.0;
+    let q = NodeQuery {
+        query: None,
+        tags: &p.tags,
+        limit: None,
+    };
+    let all = index.find_nodes(&q).map_err(internal)?;
+
+    let mut tasks: Vec<NodeMeta> = all
+        .into_iter()
+        .filter(|n| {
+            let has_todo = if p.todo_states.is_empty() {
+                n.todo.is_some()
+            } else {
+                n.todo
+                    .as_ref()
+                    .is_some_and(|t| p.todo_states.iter().any(|s| s.eq_ignore_ascii_case(t)))
+            };
+            if !has_todo {
+                return false;
+            }
+            if let Some(priority) = &p.priority {
+                return n
+                    .priority
+                    .as_ref()
+                    .is_some_and(|pr| pr.eq_ignore_ascii_case(priority));
+            }
+            true
+        })
+        .collect();
+
+    match p.sort.as_deref() {
+        Some("priority") => tasks.sort_by(|a, b| {
+            // Nodes with a priority come before those without; within
+            // the same priority letter sort by title.
+            let pa = a.priority.as_deref().unwrap_or("Z");
+            let pb = b.priority.as_deref().unwrap_or("Z");
+            pa.cmp(pb).then_with(|| a.title.cmp(&b.title))
+        }),
+        Some("title_desc") => tasks.sort_by(|a, b| b.title.cmp(&a.title)),
+        _ => tasks.sort_by(|a, b| a.title.cmp(&b.title)),
+    }
+
+    let total = tasks.len();
+    let offset = p.offset.unwrap_or(0);
+    let limit = p.limit.unwrap_or(50);
+    let page: Vec<NodeMeta> = tasks.into_iter().skip(offset).take(limit).collect();
+    let payload = serde_json::json!({
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "count": page.len(),
+        "nodes": page,
+    });
+    Ok(json_result(&payload))
+}
+
+// ── get_outline ────────────────────────────────────────────────────────────────
+
+/// `get_outline` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GetOutlineParams {
+    /// Node ID whose file to outline.
+    pub id: String,
+}
+
+/// `get_outline` — return the hierarchical heading tree for the file that
+/// contains `id`. Every headline in the file is included, not just the node's
+/// own subtree, so the caller gets full navigational context.
+///
+/// # Errors
+///
+/// Returns an error if the node is not found or its file cannot be read.
+pub fn get_outline(
+    index: &Arc<dyn RoamIndex>,
+    p: &Parameters<GetOutlineParams>,
+) -> Result<CallToolResult, McpError> {
+    let node = index
+        .node(&p.0.id)
+        .map_err(internal)?
+        .ok_or_else(|| McpError::invalid_params("node not found", None))?;
+
+    let doc = OrgDoc::from_file(&node.file).map_err(internal)?;
+    let headlines = doc.headlines();
+    let outline = build_outline_tree(&headlines);
+
+    let payload = serde_json::json!({
+        "id": p.0.id,
+        "file": node.file,
+        "title": node.title,
+        "outline": outline,
+    });
+    Ok(json_result(&payload))
+}
+
+/// Build a nested JSON tree from a flat depth-first list of org headlines.
+///
+/// Each node in the output:
+/// ```json
+/// { "title": "…", "level": 2, "todo": null, "priority": null, "tags": [], "children": [] }
+/// ```
+struct OutlineFrame {
+    level: usize,
+    node: serde_json::Value,
+    children: Vec<serde_json::Value>,
+}
+
+fn close_outline_frame(frame: OutlineFrame) -> serde_json::Value {
+    let mut n = frame.node;
+    n["children"] = serde_json::Value::Array(frame.children);
+    n
+}
+
+/// Pop one frame off the stack and attach it to its parent (or to `roots`).
+fn pop_outline_frame(stack: &mut Vec<OutlineFrame>, roots: &mut Vec<serde_json::Value>) {
+    if let Some(frame) = stack.pop() {
+        let closed = close_outline_frame(frame);
+        if let Some(parent) = stack.last_mut() {
+            parent.children.push(closed);
+        } else {
+            roots.push(closed);
+        }
+    }
+}
+
+fn build_outline_tree(headlines: &[OrgHeadline]) -> Vec<serde_json::Value> {
+    let mut stack: Vec<OutlineFrame> = Vec::new();
+    let mut roots: Vec<serde_json::Value> = Vec::new();
+
+    for h in headlines {
+        let level = h.level();
+        let node = serde_json::json!({
+            "title": h.title_raw().trim().to_string(),
+            "level": level,
+            "todo": h.todo_keyword().map(|t| t.to_string()),
+            "priority": h.priority().map(|t| t.to_string()),
+            "tags": h.tags().map(|t| t.to_string()).collect::<Vec<_>>(),
+        });
+
+        // Pop all frames at this level or deeper — they are now fully closed.
+        while stack.last().is_some_and(|f| f.level >= level) {
+            pop_outline_frame(&mut stack, &mut roots);
+        }
+
+        stack.push(OutlineFrame {
+            level,
+            node,
+            children: Vec::new(),
+        });
+    }
+
+    // Drain remaining open frames.
+    while !stack.is_empty() {
+        pop_outline_frame(&mut stack, &mut roots);
+    }
+
+    roots
+}
+
+// ── list_files ────────────────────────────────────────────────────────────────
+
+/// `list_files` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct ListFilesParams {
+    /// Page size. Defaults to 100.
+    #[serde(default)]
+    pub limit: Option<usize>,
+
+    /// Number of files to skip. Defaults to 0.
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+/// Build a JSON row for a single `.org` file, attaching filesystem metadata
+/// and (when present) the node ID + title from the index.
+fn org_file_row(
+    path: &std::path::Path,
+    roam_dir: &Path,
+    file_index: &HashMap<PathBuf, (String, String)>,
+) -> serde_json::Value {
+    let rel = path.strip_prefix(roam_dir).unwrap_or(path);
+    let mut row = serde_json::json!({ "path": path, "relative_path": rel });
+    if let Ok(meta) = std::fs::metadata(path) {
+        row["size_bytes"] = meta.len().into();
+        if let Ok(modified) = meta.modified() {
+            if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
+                row["modified_unix"] = dur.as_secs().into();
+            }
+        }
+    }
+    if let Some((id, title)) = file_index.get(path) {
+        row["node_id"] = id.clone().into();
+        row["title"] = title.clone().into();
+    }
+    row
+}
+
+fn collect_org_files(
+    roam_dir: &Path,
+    file_index: &HashMap<PathBuf, (String, String)>,
+) -> Vec<serde_json::Value> {
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(roam_dir)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("org") {
+            continue;
+        }
+        files.push(org_file_row(entry.path(), roam_dir, file_index));
+    }
+    files
+}
+
+/// `list_files` — enumerate every `.org` file in the vault regardless of
+/// whether it has a file-level `:ID:`. This complements `list_nodes` which
+/// only returns nodes known to the index.
+///
+/// Each entry includes the absolute path, the path relative to the roam dir,
+/// file size, Unix mtime, and the node ID + title if the index knows about it.
+///
+/// # Errors
+///
+/// Returns an error if the index query fails.
+pub fn list_files(
+    index: &Arc<dyn RoamIndex>,
+    roam_dir: &Path,
+    p: Parameters<ListFilesParams>,
+) -> Result<CallToolResult, McpError> {
+    let p = p.0;
+
+    let all_nodes = index
+        .find_nodes(&NodeQuery {
+            query: None,
+            tags: &[],
+            limit: None,
+        })
+        .map_err(internal)?;
+    let mut file_index: HashMap<PathBuf, (String, String)> = HashMap::new();
+    for n in &all_nodes {
+        if n.is_file() {
+            file_index
+                .entry(n.file.clone())
+                .or_insert_with(|| (n.id.clone(), n.title.clone()));
+        }
+    }
+
+    let files = collect_org_files(roam_dir, &file_index);
+
+    let total = files.len();
+    let offset = p.offset.unwrap_or(0);
+    let limit = p.limit.unwrap_or(100);
+    let page: Vec<serde_json::Value> = files.into_iter().skip(offset).take(limit).collect();
+    let payload = serde_json::json!({
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "count": page.len(),
+        "files": page,
+    });
+    Ok(json_result(&payload))
+}
+
+// ── fuzzy scoring ─────────────────────────────────────────────────────────────
+
+/// Score how well `query` matches `candidate`.
+///
+/// Both inputs must already be lowercased. Returns 0 for no match, higher is
+/// better. Tiers: exact (1000) → prefix (900) → substring (700) →
+/// subsequence with density bonus (1–50) → 0 (no match).
+fn fuzzy_score(query: &str, candidate: &str) -> u32 {
+    if query.is_empty() {
+        return 50;
+    }
+    if candidate == query {
+        return 1000;
+    }
+    if candidate.starts_with(query) {
+        return 900;
+    }
+    if candidate.contains(query) {
+        return 700;
+    }
+    // Subsequence check: every char of the query appears in order.
+    let mut qi = query.chars().peekable();
+    for ch in candidate.chars() {
+        if qi.peek() == Some(&ch) {
+            qi.next();
+        }
+    }
+    if qi.peek().is_none() {
+        // Higher density → higher score (short candidate means compact match).
+        let density = (query.len() * 50) / candidate.len().max(1);
+        return u32::try_from(density.max(1)).unwrap_or(1);
+    }
+    0
 }
 
 /// Dedicated targets `<<name>>` in `text` (excluding radio targets

@@ -12,6 +12,10 @@ readme = "README.md"
 name = "org-roam-mcp"
 path = "src/main.rs"
 
+[[bin]]
+name = "org-roam-cli"
+path = "src/bin/cli.rs"
+
 [lib]
 name = "org_roam_mcp"
 path = "src/lib.rs"
