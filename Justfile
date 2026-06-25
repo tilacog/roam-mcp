@@ -3,6 +3,10 @@
 setup:
     cargo binstall --no-confirm cargo-llvm-cov cargo-crap || cargo install --locked cargo-llvm-cov cargo-crap
 
+# Install binaries to the cargo bin directory.
+install:
+    cargo install --path .
+
 clippy:
     cargo clippy --all-targets -- -W clippy::pedantic -D warnings
 
