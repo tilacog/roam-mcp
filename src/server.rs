@@ -737,6 +737,15 @@ impl RoamServer {
         query::get_node(&index, &p)
     }
 
+    #[tool(description = "Return a random node from the index")]
+    async fn random_node(
+        &self,
+        p: Parameters<query::RandomNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::random_node(&index, p)
+    }
+
     #[tool(
         description = "Get a sub-section of a node by anchor: CUSTOM_ID, headline title, dedicated target, or free text"
     )]
@@ -1356,7 +1365,7 @@ impl ServerHandler for RoamServer {
                  get_node_section, get_backlinks, get_forward_links, find_by_ref, get_refs, \
                  list_tags, tag_cooccurrences, list_anchors, unlinked_references, \
                  list_node_tags, has_tag, search_by_tag, validate_node, get_daily_note, \
-                 list_dailies, server_info, sync_database. \
+                 list_dailies, random_node, server_info, sync_database. \
                  Write tools (removed in --read-only): create_node, update_node, delete_node, \
                  rename_node, append_to_node, prepend_to_node, add_link, insert_anchor, \
                  daily_capture, add_tag, remove_tag, set_tags. \

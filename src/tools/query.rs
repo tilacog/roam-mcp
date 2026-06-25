@@ -41,6 +41,10 @@ pub struct GetNodeParams {
     pub id: String,
 }
 
+/// `random_node` parameters (empty for now, but allows future options).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct RandomNodeParams {}
+
 /// `find_by_ref` parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FindByRefParams {
@@ -203,7 +207,30 @@ pub fn get_node(
     let body = read_node_body(index, &p.0.id).map_err(McpError::from)?;
     let warning = body.stale_warning();
     let mut out = serde_json::to_value(&body.node).map_err(internal)?;
-    out["body"] = body.body.into();
+    out["body"] = body.body.clone().into();
+    if let Some(w) = warning {
+        out["warning"] = w.into();
+    }
+    Ok(CallToolResult::success(vec![Content::text(
+        serde_json::to_string_pretty(&out).unwrap_or_default(),
+    )]))
+}
+
+/// `random_node` — return a random node from the index.
+///
+/// # Errors
+///
+/// Returns an error if the index query fails or the index is empty.
+pub fn random_node(
+    index: &Arc<dyn RoamIndex>,
+    _p: Parameters<RandomNodeParams>,
+) -> Result<CallToolResult, McpError> {
+    let node = index.random_node().map_err(internal)?;
+    let mut out = serde_json::to_value(&node).map_err(internal)?;
+    // Also include the body for convenience, matching get_node behavior
+    let body = crate::tools::content::read_node_body(index, &node.id).map_err(McpError::from)?;
+    let warning = body.stale_warning();
+    out["body"] = body.body.clone().into();
     if let Some(w) = warning {
         out["warning"] = w.into();
     }

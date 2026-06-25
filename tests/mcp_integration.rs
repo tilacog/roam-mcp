@@ -219,6 +219,25 @@ async fn server_read_resource_returns_node_body() {
     .await;
 }
 
+#[tokio::test]
+async fn server_random_node_returns_node() {
+    let cfg = Config::from_args(&fixture_dir(), true, true, None).unwrap();
+    let server = RoamServer::new(cfg).unwrap();
+    run_with_server(server, |peer| async move {
+        let result = peer
+            .call_tool(CallToolRequestParams::new("random_node").with_arguments(object!({})))
+            .await
+            .expect("random_node call");
+        let text = text_of(&result);
+        // Should return a node with metadata and id, at minimum, an id and title
+        assert!(
+            text.contains("\"id\"") && text.contains("\"title\""),
+            "expected node with id and title, got: {text}"
+        );
+    })
+    .await;
+}
+
 // --- §1: anchor prefix syntax is accepted server-side -------------------
 
 #[tokio::test]

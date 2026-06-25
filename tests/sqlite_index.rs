@@ -657,3 +657,82 @@ fn sqlite_search_by_tag_is_exact_and_case_sensitive() {
     );
     assert_eq!(v["nodes"], serde_json::json!([]));
 }
+
+// --- §random_node: SQLite backend coverage --------------------------------
+
+#[test]
+fn random_node_returns_one_of_the_known_nodes_with_metadata() {
+    // The synthetic db has three nodes (psalm, shepherd, verse). A random
+    // draw must return exactly one of them, with aliases/tags populated
+    // when applicable — parity with the scanner backend.
+    let dir = tempfile::tempdir().unwrap();
+    let idx = open_index(&dir);
+
+    let known: std::collections::HashSet<&str> =
+        [PSALM_ID, SHEPHERD_ID, VERSE_ID].into_iter().collect();
+
+    // Sample several times so the test is not silently a no-op when RANDOM()
+    // happens to land on the same row.
+    for _ in 0..20 {
+        let node = idx.random_node().expect("random_node on populated index");
+        assert!(
+            known.contains(node.id.as_str()),
+            "random_node returned an unknown id: {}",
+            node.id
+        );
+        // file-level psalm carries aliases/tags; verify at least one draw
+        // populates them. verse is a headline with no aliases; psalm has tags.
+        if node.id == PSALM_ID {
+            assert!(
+                node.tags.iter().any(|t| t == "pastafarianism"),
+                "psalm must carry its tags via attach_aliases_and_tags: {node:?}"
+            );
+            assert!(
+                node.aliases.iter().any(|a| a == "The Noodly Psalm"),
+                "psalm must carry its aliases: {node:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn random_node_on_empty_index_returns_not_found() {
+    // Schema present but no rows → the query yields no rows, which must
+    // surface as a NotFound error rather than a Sqlite error or panic.
+    let dir = tempfile::tempdir().unwrap();
+    let db = synthetic_db(dir.path());
+    let conn = rusqlite::Connection::open(&db).expect("open db");
+    conn.execute("DELETE FROM nodes", []).expect("clear nodes");
+    drop(conn);
+
+    let idx = SqliteIndex::open(&db).expect("open");
+    let err = idx.random_node().expect_err("empty index should error");
+    assert!(
+        matches!(err, org_roam_mcp::index::IndexError::NotFound(_)),
+        "expected NotFound for empty index, got {err:?}"
+    );
+}
+
+#[test]
+fn random_node_without_nodes_table_returns_not_found() {
+    // A db with no `nodes` table at all → has_columns short-circuits to a
+    // NotFound ("no nodes table") instead of a raw Sqlite error.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("org-roam.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("create db");
+    conn.execute_batch(
+        "CREATE TABLE files (file PRIMARY KEY, title, hash NOT NULL, \
+             atime NOT NULL, mtime NOT NULL);",
+    )
+    .expect("schema without nodes");
+    drop(conn);
+
+    let idx = SqliteIndex::open(&db_path).expect("open");
+    let err = idx
+        .random_node()
+        .expect_err("missing nodes table should error");
+    assert!(
+        matches!(err, org_roam_mcp::index::IndexError::NotFound(ref m) if m.contains("nodes")),
+        "expected NotFound mentioning nodes for missing table, got {err:?}"
+    );
+}

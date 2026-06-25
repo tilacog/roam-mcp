@@ -450,6 +450,31 @@ impl RoamIndex for SqliteIndex {
         usize::try_from(n).map_err(|_| IndexError::Other("node count overflow".into()))
     }
 
+    fn random_node(&self) -> IndexResult<NodeMeta> {
+        if !self.has_columns("nodes", &["id"]) {
+            return Err(IndexError::NotFound("no nodes table".into()));
+        }
+        let node = {
+            let conn = self.lock()?;
+            let sql = format!(
+                "SELECT {} FROM nodes ORDER BY RANDOM() LIMIT 1",
+                self.node_select()
+            );
+            let mut stmt = conn.prepare(&sql).map_err(IndexError::Sqlite)?;
+            let mut rows = stmt
+                .query_map([], row_to_node_meta)
+                .map_err(IndexError::Sqlite)?;
+            match rows.next() {
+                Some(Ok(n)) => n,
+                Some(Err(e)) => return Err(IndexError::Sqlite(e)),
+                None => return Err(IndexError::NotFound("index is empty".into())),
+            }
+        };
+        let mut nodes = vec![node];
+        self.attach_aliases_and_tags(&mut nodes)?;
+        Ok(nodes.pop().unwrap())
+    }
+
     fn orphans(&self) -> IndexResult<Vec<NodeMeta>> {
         if !self.has_columns("nodes", &["id"]) {
             return Ok(vec![]);

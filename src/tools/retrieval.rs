@@ -165,6 +165,18 @@ mod tests {
         fn orphans(&self) -> IndexResult<Vec<NodeMeta>> {
             Ok(Vec::new())
         }
+        fn random_node(&self) -> IndexResult<NodeMeta> {
+            use crate::index::IndexError;
+            use rand::prelude::IndexedRandom;
+            if self.0.is_empty() {
+                return Err(IndexError::NotFound("index is empty".into()));
+            }
+            let mut rng = rand::rng();
+            self.0
+                .choose(&mut rng)
+                .cloned()
+                .ok_or_else(|| IndexError::NotFound("index is empty".into()))
+        }
         fn source(&self) -> &'static str {
             "fake"
         }

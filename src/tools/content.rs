@@ -209,6 +209,9 @@ mod tests {
         fn orphans(&self) -> IndexResult<Vec<NodeMeta>> {
             Ok(Vec::new())
         }
+        fn random_node(&self) -> IndexResult<NodeMeta> {
+            Ok(self.0.clone())
+        }
         fn source(&self) -> &'static str {
             "one"
         }

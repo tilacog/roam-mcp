@@ -51,6 +51,9 @@ impl RoamIndex for StaleIndex {
     fn orphans(&self) -> IndexResult<Vec<NodeMeta>> {
         Ok(Vec::new())
     }
+    fn random_node(&self) -> IndexResult<NodeMeta> {
+        Ok(self.meta.clone())
+    }
     fn source(&self) -> &'static str {
         "stale"
     }

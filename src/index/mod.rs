@@ -191,6 +191,13 @@ pub trait RoamIndex: Send + Sync {
 
     /// Where this index reads its data from (DB path or roam dir).
     fn source(&self) -> &str;
+
+    /// Return a random node from the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend query fails or the index is empty.
+    fn random_node(&self) -> IndexResult<NodeMeta>;
 }
 
 /// Pick the appropriate backend for a `Config`. Prefers `SQLite` if a DB is

@@ -16,7 +16,7 @@ use orgize::ast::{Document, Link};
 use orgize::rowan::ast::AstNode as _;
 use walkdir::WalkDir;
 
-use super::{IndexResult, LinkRecord, NodeMeta, NodeQuery, RoamIndex};
+use super::{IndexError, IndexResult, LinkRecord, NodeMeta, NodeQuery, RoamIndex};
 use crate::org::OrgDoc;
 
 /// In-memory index built by walking a directory.
@@ -130,6 +130,19 @@ impl RoamIndex for ScanIndex {
 
     fn node_count(&self) -> IndexResult<usize> {
         Ok(self.nodes.len())
+    }
+
+    fn random_node(&self) -> IndexResult<NodeMeta> {
+        use rand::prelude::IndexedRandom;
+        if self.nodes.is_empty() {
+            return Err(IndexError::NotFound("index is empty".into()));
+        }
+        let mut rng = rand::rng();
+        let nodes: Vec<NodeMeta> = self.nodes.values().cloned().collect();
+        nodes
+            .choose(&mut rng)
+            .ok_or_else(|| IndexError::NotFound("index is empty".into()))
+            .cloned()
     }
 
     fn orphans(&self) -> IndexResult<Vec<NodeMeta>> {
