@@ -54,6 +54,12 @@ impl RoamIndex for StaleIndex {
     fn random_node(&self) -> IndexResult<NodeMeta> {
         Ok(self.meta.clone())
     }
+    fn node_by_path(&self, _path: &std::path::Path) -> IndexResult<Option<NodeMeta>> {
+        Ok(None)
+    }
+    fn nodes_with_external_links(&self) -> IndexResult<Vec<(NodeMeta, Vec<LinkRecord>)>> {
+        Ok(Vec::new())
+    }
     fn source(&self) -> &'static str {
         "stale"
     }

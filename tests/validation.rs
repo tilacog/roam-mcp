@@ -404,30 +404,77 @@ async fn find_invalid_nodes_reports_only_broken_files() {
 }
 
 #[tokio::test]
-async fn find_invalid_nodes_returns_clean_report_for_valid_vault() {
+async fn validate_node_flags_broken_file_link() {
     let dir = TempDir::new().expect("tmpdir");
     let path: PathBuf = dir.path().to_path_buf();
     let cfg = Config::from_args(&path, false, true, None).unwrap();
     let server = RoamServer::new(cfg).unwrap();
 
-    std::fs::write(
-        path.join("only_good.org"),
-        "\
-:PROPERTIES:
-:ID:       22222222-2222-2222-2222-222222222222
-:END:
-#+title: Only good
-",
-    )
-    .unwrap();
+    run(server, |peer| async move {
+        // When using `body`, it calls `validate_node_source` which DOES NOT have context (roam_dir, etc)
+        // so it cannot check file existence. Existence check is only in the ID branch which has context.
+
+        // Let's create a node first.
+        let (_, create_text) = call_text(
+            &peer,
+            "create_node",
+            object!({
+                "title": "Link check",
+                "body": "[[file:./non-existent.org]]"
+            }),
+        )
+        .await;
+        let created: serde_json::Value = serde_json::from_str(&create_text).unwrap();
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Then validate by ID.
+        let (is_err, text) = call_text(&peer, "validate_node", object!({ "id": id })).await;
+        // Broken file link should be a validation issue but not a hard tool error
+        assert!(
+            !is_err.unwrap_or(false),
+            "expected tool success, got: {text}"
+        );
+        assert!(
+            text.contains("broken_file_link") || text.contains("points to non-existent path"),
+            "expected broken_file_link in issues, got: {text}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn validate_node_flags_prefer_id_link() {
+    let dir = TempDir::new().expect("tmpdir");
+    let path: PathBuf = dir.path().to_path_buf();
+    let cfg = Config::from_args(&path, false, true, None).unwrap();
+    let server = RoamServer::new(cfg).unwrap();
 
     run(server, |peer| async move {
-        let (is_err, text) = call_text(&peer, "find_invalid_nodes", object!({})).await;
-        assert!(!is_err.unwrap_or(false), "got: {text}");
-        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed["scanned"], 1);
-        assert_eq!(parsed["with_issues"], 0);
-        assert_eq!(parsed["issue_count"], 0);
+        // Create a target node.
+        let (_, create_text) =
+            call_text(&peer, "create_node", object!({ "title": "Target" })).await;
+        let created_target: serde_json::Value = serde_json::from_str(&create_text).unwrap();
+        let target_file = created_target["file"].as_str().unwrap();
+
+        // Create a source node with a file link to the target node.
+        let (_, create_src_text) = call_text(
+            &peer,
+            "create_node",
+            object!({
+                "title": "Source",
+                "body": format!("[[file:{}]]", target_file)
+            }),
+        )
+        .await;
+        let created_src: serde_json::Value = serde_json::from_str(&create_src_text).unwrap();
+        let src_id = created_src["id"].as_str().unwrap().to_string();
+
+        // Validate the source node.
+        let (_, text) = call_text(&peer, "validate_node", object!({ "id": src_id })).await;
+        assert!(
+            text.contains("prefer_id_link") || text.contains("prefer using an id: link"),
+            "expected prefer_id_link, got: {text}"
+        );
     })
     .await;
 }

@@ -105,7 +105,7 @@ pub struct LinkRecord {
     /// through as-is.
     pub kind: String,
 
-    /// For URL/citation links, the full URL or `@citekey`.
+    /// For URL/citation/file links, the full URL, @citekey, or file path.
     pub ref_target: Option<String>,
 }
 
@@ -198,6 +198,21 @@ pub trait RoamIndex: Send + Sync {
     ///
     /// Returns an error if the backend query fails or the index is empty.
     fn random_node(&self) -> IndexResult<NodeMeta>;
+
+    /// Find a node by its absolute file path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend query fails.
+    fn node_by_path(&self, path: &std::path::Path) -> IndexResult<Option<NodeMeta>>;
+
+    /// Find nodes that contain external links (file, http, https, cite).
+    /// Returns pairs of (node metadata, list of external links found in it).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend query fails.
+    fn nodes_with_external_links(&self) -> IndexResult<Vec<(NodeMeta, Vec<LinkRecord>)>>;
 }
 
 /// Pick the appropriate backend for a `Config`. Prefers `SQLite` if a DB is

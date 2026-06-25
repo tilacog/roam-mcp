@@ -264,6 +264,33 @@ impl RoamIndex for SqliteIndex {
         Ok(nodes.pop())
     }
 
+    fn node_by_path(&self, path: &Path) -> IndexResult<Option<NodeMeta>> {
+        if !self.has_columns("nodes", &["id", "file"]) {
+            return Ok(None);
+        }
+        let sql = format!(
+            "SELECT {} FROM nodes WHERE file = ? AND level = 0",
+            self.node_select()
+        );
+        let meta = {
+            let conn = self.lock()?;
+            let mut stmt = conn.prepare(&sql).map_err(IndexError::Sqlite)?;
+            // Paths in sqlite are absolute and quoted.
+            let path_str = path.to_str().unwrap_or_default();
+            let mut rows = stmt
+                .query([emacsql::quote(path_str)])
+                .map_err(IndexError::Sqlite)?;
+            match rows.next().map_err(IndexError::Sqlite)? {
+                Some(r) => Some(row_to_node_meta(r)?),
+                None => None,
+            }
+        };
+        let Some(meta) = meta else { return Ok(None) };
+        let mut nodes = vec![meta];
+        self.attach_aliases_and_tags(&mut nodes)?;
+        Ok(nodes.pop())
+    }
+
     fn backlinks(&self, id: &str) -> IndexResult<Vec<LinkRecord>> {
         if !self.has_columns("links", &["source", "dest", "type"]) {
             return Ok(vec![]);
@@ -523,6 +550,93 @@ impl RoamIndex for SqliteIndex {
     fn source(&self) -> &str {
         self.path.to_str().unwrap_or("(sqlite)")
     }
+
+    fn nodes_with_external_links(&self) -> IndexResult<Vec<(NodeMeta, Vec<LinkRecord>)>> {
+        if !self.has_columns("links", &["source", "dest", "type"]) {
+            return Ok(vec![]);
+        }
+
+        let types = [
+            emacsql::quote("file"),
+            emacsql::quote("http"),
+            emacsql::quote("https"),
+            emacsql::quote("cite"),
+        ];
+
+        let mut grouped: HashMap<String, Vec<LinkRecord>> = HashMap::new();
+        {
+            let conn = self.lock()?;
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT source, dest, type FROM links \
+                     WHERE type IN ('{}', '{}', '{}', '{}') \
+                     ORDER BY source",
+                    types[0], types[1], types[2], types[3]
+                ))
+                .map_err(IndexError::Sqlite)?;
+
+            let rows = stmt
+                .query_map([], |r| {
+                    let source: String = r.get(0)?;
+                    let dest: String = r.get(1)?;
+                    let kind: Option<String> = r.get(2)?;
+                    Ok(link_record(&source, &dest, kind.as_deref()))
+                })
+                .map_err(IndexError::Sqlite)?;
+
+            for row in rows {
+                let l = row.map_err(IndexError::Sqlite)?;
+                grouped.entry(l.source.clone()).or_default().push(l);
+            }
+        }
+
+        if grouped.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut ids: Vec<String> = grouped.keys().cloned().collect();
+        ids.sort();
+
+        let mut nodes = Vec::new();
+        {
+            let conn = self.lock()?;
+            for chunk in ids.chunks(500) {
+                let placeholders = vec!["?"; chunk.len()].join(", ");
+                let sql = format!(
+                    "SELECT {} FROM nodes WHERE id IN ({})",
+                    self.node_select(),
+                    placeholders
+                );
+                let mut stmt = conn.prepare(&sql).map_err(IndexError::Sqlite)?;
+                let bind_refs: Vec<String> = chunk.iter().map(|id| emacsql::quote(id)).collect();
+                let bind_refs_borrowed: Vec<&dyn rusqlite::ToSql> = bind_refs
+                    .iter()
+                    .map(|c| c as &dyn rusqlite::ToSql)
+                    .collect();
+
+                let rows = stmt
+                    .query_map(&bind_refs_borrowed[..], row_to_node_meta)
+                    .map_err(IndexError::Sqlite)?;
+
+                for row in rows {
+                    nodes.push(row.map_err(IndexError::Sqlite)?);
+                }
+            }
+        }
+
+        self.attach_aliases_and_tags(&mut nodes)?;
+
+        let mut out = Vec::new();
+        for node in nodes {
+            if let Some(links) = grouped.remove(&node.id) {
+                out.push((node, links));
+            }
+        }
+
+        // Sort by title to match scanner backend and other tools.
+        out.sort_by(|a, b| a.0.title.cmp(&b.0.title));
+        Ok(out)
+    }
 }
 
 impl SqliteIndex {
@@ -593,6 +707,7 @@ fn link_record(source: &str, dest: &str, kind: Option<&str>) -> LinkRecord {
     let ref_target = match kind.as_str() {
         "cite" => Some(format!("@{dest}")),
         "http" | "https" => Some(format!("{kind}:{dest}")),
+        "file" => Some(dest.clone()),
         _ => None,
     };
     LinkRecord {
@@ -975,5 +1090,50 @@ pub mod emacsql {
                 ])
             );
         }
+    }
+
+    #[tokio::test]
+    async fn sqlite_nodes_with_external_links() {
+        use super::SqliteIndex;
+        use crate::index::RoamIndex;
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("org-roam.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (id TEXT PRIMARY KEY, file TEXT, title TEXT, level INTEGER, pos INTEGER, todo TEXT, priority TEXT, olp TEXT); \
+             CREATE TABLE links (source TEXT, dest TEXT, type TEXT); \
+             INSERT INTO nodes (id, file, title, level, pos) VALUES ('\"source-id\"', '\"/tmp/s.org\"', '\"Source\"', 0, 0); \
+             INSERT INTO links (source, dest, type) VALUES ('\"source-id\"', '\"https://example.com\"', '\"https\"');"
+        ).unwrap();
+        drop(conn);
+
+        let index = SqliteIndex::open(&db_path).unwrap();
+        let nodes = index.nodes_with_external_links().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].0.id, "source-id");
+        assert_eq!(nodes[0].1.len(), 1);
+        assert_eq!(nodes[0].1[0].kind, "https");
+    }
+
+    #[tokio::test]
+    async fn sqlite_node_by_path() {
+        use super::SqliteIndex;
+        use crate::index::RoamIndex;
+        use std::path::Path;
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("org-roam.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (id TEXT PRIMARY KEY, file TEXT, title TEXT, level INTEGER, pos INTEGER, todo TEXT, priority TEXT, olp TEXT); \
+             INSERT INTO nodes (id, file, title, level, pos) VALUES ('\"some-id\"', '\"/tmp/p.org\"', '\"Title\"', 0, 0);"
+        ).unwrap();
+        drop(conn);
+
+        let index = SqliteIndex::open(&db_path).unwrap();
+        let node = index
+            .node_by_path(Path::new("/tmp/p.org"))
+            .unwrap()
+            .expect("node");
+        assert_eq!(node.id, "some-id");
     }
 }

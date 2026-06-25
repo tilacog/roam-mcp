@@ -73,6 +73,7 @@ pub struct ValidateNodeParams {
 /// Returns an error if neither `id` nor `body` is provided, if the
 /// `id` branch cannot find the node, or if the index query fails.
 pub fn validate_node(
+    config: &crate::config::Config,
     index: &Arc<dyn RoamIndex>,
     p: &Parameters<ValidateNodeParams>,
 ) -> Result<CallToolResult, McpError> {
@@ -83,7 +84,7 @@ pub fn validate_node(
         let id = p.id.as_deref().ok_or_else(|| {
             McpError::invalid_params("validate_node requires either `id` or `body`", None)
         })?;
-        validate_by_id(index, id)
+        validate_by_id(config, index, id)
     }
 }
 
@@ -106,7 +107,11 @@ fn validate_source(body: &str) -> CallToolResult {
 
 /// ID branch: keep the original cross-node semantics. Refactored out
 /// of `tools/query.rs` so the same entry-point handles both branches.
-fn validate_by_id(index: &Arc<dyn RoamIndex>, id: &str) -> Result<CallToolResult, McpError> {
+fn validate_by_id(
+    config: &crate::config::Config,
+    index: &Arc<dyn RoamIndex>,
+    id: &str,
+) -> Result<CallToolResult, McpError> {
     let internal =
         |e: &dyn std::fmt::Display| -> McpError { McpError::internal_error(e.to_string(), None) };
     let node = index
@@ -114,8 +119,18 @@ fn validate_by_id(index: &Arc<dyn RoamIndex>, id: &str) -> Result<CallToolResult
         .map_err(|e| internal(&e))?
         .ok_or_else(|| McpError::invalid_params("node not found", None))?;
 
-    let mut issues: Vec<String> = Vec::new();
-    let doc = OrgDoc::from_file(&node.file).map_err(|e| internal(&e))?;
+    let text = std::fs::read_to_string(&node.file).map_err(|e| internal(&e))?;
+    let mut report = validation::validate_node_source(&text);
+    validation::validate_node_with_context(
+        &text,
+        &config.roam_dir,
+        &node.file,
+        Some(index.as_ref()),
+        &mut report,
+    );
+
+    let mut issues: Vec<String> = report.issues.into_iter().map(|i| i.message).collect();
+    let doc = OrgDoc::from_text(text);
     let id_in_file = if node.is_file() {
         doc.document()
             .properties()

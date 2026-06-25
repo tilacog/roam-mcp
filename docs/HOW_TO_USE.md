@@ -27,11 +27,11 @@ The server is a **read-write org-roam knowledge base** exposed over
 MCP. The 27 tools split into three groups:
 
 - **Read** (always available): `search_nodes`, `list_nodes`,
-  `list_orphans`, `search_text`, `get_node`, `get_node_by_path`,
-  `get_node_section`, `get_backlinks`, `get_forward_links`,
-  `find_by_ref`, `get_refs`, `list_tags`, `tag_cooccurrences`,
-  `list_anchors`, `unlinked_references`, `validate_node`,
-  `list_node_tags`, `has_tag`, `search_by_tag`,
+  `list_orphans`, `list_external_links`, `search_text`, `get_node`,
+  `get_node_by_path`, `get_node_section`, `get_backlinks`,
+  `get_forward_links`, `find_by_ref`, `get_refs`, `list_tags`,
+  `tag_cooccurrences`, `list_anchors`, `unlinked_references`,
+  `validate_node`, `list_node_tags`, `has_tag`, `search_by_tag`,
   `get_daily_note`, `list_dailies`, `server_info`, `sync_database`.
 - **Write** (removed in `--read-only` mode): `create_node`,
   `update_node`, `delete_node`, `rename_node`, `append_to_node`,
@@ -173,7 +173,7 @@ Or, the agent does the same loop manually:
 2. Score candidates by keyword overlap with the draft.
 3. Return the top N with the suggested link form.
 
-### 6. "Tidy my vault: find orphans and dangling links"
+### 6. "Tidy my vault: find orphans and broken links"
 
 A periodic maintenance task: surface notes that are unreachable and
 notes that point at things that no longer exist.
@@ -187,9 +187,14 @@ What the agent does:
 1. `list_orphans({ limit: 100 })` — notes with no `id:` edges in or
    out. They exist in the vault but are unreachable. These are the
    prime candidates for merge/link/delete.
-2. For a few specific notes the user names, `validate_node({ id })`
-   — reports a stale `:ID:`, an empty title, or dangling `id:` links.
-3. For each dangling id, decide: rename, recreate, or remove.
+2. `list_external_links({ limit: 50 })` — find nodes that contain
+   `file:`, `http:`, or `cite:` links to audit them.
+3. For a few specific notes the user names, `validate_node({ id })`
+   — reports a stale `:ID:`, an empty title, dangling `id:` links,
+   or **broken `file:` links** (non-existent paths). It also flags
+   file links that point inside the vault but should be `id:` links.
+4. For each dangling id or broken path, decide: rename, recreate,
+   or remove.
 
 ### 7. "Read a long note section-by-section"
 
@@ -403,6 +408,7 @@ not the full schema.
 | `search_nodes` | `query`, `tags`, `limit` | List of node metadata (id, title, aliases, tags, file) |
 | `list_nodes` | `filter`, `tags`, `limit`, `offset`, `sort` | Paginated node list + total |
 | `list_orphans` | `limit`, `offset`, `sort` | Notes with no `id:` edges, paged |
+| `list_external_links` | `limit`, `offset` | Nodes with `file:`, `http:`, or `cite:` links |
 | `search_text` | `query`, `limit` | File path + line + snippet + node_id (when in a file node) |
 | `get_node` | `id` | Metadata + body |
 | `get_node_by_path` | `path` | Same as `get_node`; resolves a `.org` path to its `:ID:` |
@@ -418,7 +424,7 @@ not the full schema.
 | `search_by_tag` | `tag`, `limit`, `offset` | Nodes bearing `tag` (exact, case-sensitive), paged |
 | `list_anchors` | `id` | `<<target>>`s, headlines, `CUSTOM_ID`s in a node |
 | `unlinked_references` | `id`, `limit` | Plain-text mentions of a node's title/aliases |
-| `validate_node` | `id` | Structural issues (stale id, empty title, dangling links) |
+| `validate_node` | `id` | Structural issues (stale id, empty title, dangling links, broken file links) |
 | `get_daily_note` | `date` (YYYY-MM-DD; default today) | Daily note body or `exists: false` |
 | `list_dailies` | `limit` | Dailies newest-first, with id and title |
 | `server_info` | — | Backend, node count, version, sync config |

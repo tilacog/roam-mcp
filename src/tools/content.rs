@@ -180,6 +180,7 @@ pub fn read_node_body(index: &Arc<dyn RoamIndex>, id: &str) -> Result<NodeBody, 
 mod tests {
     use super::*;
     use crate::index::{IndexResult, LinkRecord, NodeMeta, NodeQuery, RoamIndex};
+    use std::path::Path;
 
     /// Index that returns one crafted node by id, reading from a real file.
     struct OneNode(NodeMeta);
@@ -211,6 +212,12 @@ mod tests {
         }
         fn random_node(&self) -> IndexResult<NodeMeta> {
             Ok(self.0.clone())
+        }
+        fn node_by_path(&self, _path: &Path) -> IndexResult<Option<NodeMeta>> {
+            Ok(None)
+        }
+        fn nodes_with_external_links(&self) -> IndexResult<Vec<(NodeMeta, Vec<LinkRecord>)>> {
+            Ok(Vec::new())
         }
         fn source(&self) -> &'static str {
             "one"

@@ -177,6 +177,14 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| IndexError::NotFound("index is empty".into()))
         }
+        fn node_by_path(&self, _path: &std::path::Path) -> IndexResult<Option<NodeMeta>> {
+            Ok(None)
+        }
+        fn nodes_with_external_links(
+            &self,
+        ) -> IndexResult<Vec<(NodeMeta, Vec<crate::index::LinkRecord>)>> {
+            Ok(Vec::new())
+        }
         fn source(&self) -> &'static str {
             "fake"
         }

@@ -20,9 +20,9 @@
 //! the `find_invalid_nodes` bulk scanner) surface that list to the MCP
 //! client and refuse to write on failure.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use orgize::ast::{Headline, Section};
+use orgize::ast::{Headline, Link, Section};
 use orgize::rowan::ast::AstNode as _;
 use orgize::SyntaxKind;
 use serde::{Deserialize, Serialize};
@@ -135,6 +135,145 @@ pub fn validate_node_source(source: &str) -> ValidationReport {
         check_structural(source, &mut report);
     }
     report
+}
+
+/// Run context-aware checks (e.g. external link validation).
+///
+/// # Errors
+///
+/// This does not return errors directly; it pushes [`ValidationIssue`]s
+/// into `report`.
+pub fn validate_node_with_context(
+    source: &str,
+    roam_dir: &Path,
+    file_path: &Path,
+    index: Option<&dyn crate::index::RoamIndex>,
+    report: &mut ValidationReport,
+) {
+    check_external_links(source, roam_dir, file_path, index, report);
+}
+
+/// Flag any external links that point to non-existent files or that
+/// should be `id:` links instead.
+fn check_external_links(
+    source: &str,
+    roam_dir: &Path,
+    file_path: &Path,
+    index: Option<&dyn crate::index::RoamIndex>,
+    report: &mut ValidationReport,
+) {
+    let doc = OrgDoc::from_text(source.to_string());
+    for n in doc.document().syntax().descendants() {
+        let Some(link) = Link::cast(n) else {
+            continue;
+        };
+        let raw_path = link.path().to_string();
+        let (line_no, col_no) = line_col_for(source, link.syntax().text_range().start().into());
+
+        let is_internal = raw_path.starts_with("id:")
+            || raw_path.starts_with("roam:")
+            || raw_path.starts_with("http:")
+            || raw_path.starts_with("https:")
+            || raw_path.starts_with("cite:")
+            || raw_path.starts_with("mailto:")
+            || raw_path.starts_with("doi:");
+
+        if let Some(rest) = raw_path.strip_prefix("file:") {
+            validate_file_link(rest, roam_dir, file_path, index, line_no, col_no, report);
+        } else if raw_path.starts_with('/')
+            || raw_path.starts_with("./")
+            || raw_path.starts_with("../")
+        {
+            validate_file_link(
+                &raw_path, roam_dir, file_path, index, line_no, col_no, report,
+            );
+        } else if !is_internal
+            && (Path::new(&raw_path)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("org"))
+                || raw_path.contains('/'))
+        {
+            // "Regular org links that point to files"
+            validate_file_link(
+                &raw_path, roam_dir, file_path, index, line_no, col_no, report,
+            );
+        }
+    }
+}
+
+fn validate_file_link(
+    path_str: &str,
+    roam_dir: &Path,
+    file_path: &Path,
+    index: Option<&dyn crate::index::RoamIndex>,
+    line_no: u32,
+    col_no: u32,
+    report: &mut ValidationReport,
+) {
+    // Strip anchors if present (e.g. `file:foo.org::*Heading`)
+    let (clean_path, _anchor) = if let Some((p, a)) = path_str.split_once("::") {
+        (p, Some(a))
+    } else {
+        (path_str, None)
+    };
+
+    if clean_path.is_empty() {
+        return;
+    }
+
+    let p = PathBuf::from(clean_path);
+    let abs_path = file_path
+        .parent()
+        .map_or_else(|| p.clone(), |parent| parent.join(&p));
+
+    // Existence check
+    if !abs_path.exists() {
+        report.push(ValidationIssue::new(
+            IssueGroup::OrgRoam,
+            "broken_file_link",
+            format!("file link points to non-existent path: {clean_path}"),
+            Some(line_no),
+            Some(col_no),
+        ));
+        return;
+    }
+
+    // Vault boundary check: if it's inside the vault, it should probably be an ID link.
+    if let Ok(canonical) = abs_path.canonicalize() {
+        if let Ok(canonical_roam) = roam_dir.canonicalize() {
+            if canonical.starts_with(&canonical_roam)
+                && canonical.extension().and_then(|e| e.to_str()) == Some("org")
+            {
+                // It's an org file in the vault. Does it have an ID?
+                let has_id = if let Some(idx) = index {
+                    idx.node_by_path(&canonical).is_ok_and(|opt| opt.is_some())
+                } else {
+                    // Fallback to checking the file directly if no index is provided
+                    OrgDoc::from_file(&canonical)
+                        .ok()
+                        .and_then(|d| {
+                            d.document()
+                                .properties()
+                                .and_then(|props| props.get("ID"))
+                                .map(|_| ())
+                        })
+                        .is_some()
+                };
+
+                if has_id {
+                    report.push(ValidationIssue::new(
+                        IssueGroup::OrgRoam,
+                        "prefer_id_link",
+                        format!(
+                            "link points to a node in the vault via file path: {clean_path}; prefer using an id: link"
+                        ),
+                        Some(line_no),
+                        Some(col_no),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 // ── org-roam invariants ────────────────────────────────────────────────────
@@ -532,7 +671,10 @@ pub fn scan_directory_for_invalid(root: &Path) -> std::io::Result<BulkValidation
             }
         };
         let node_id = find_properties_drawer(&source).and_then(|d| d.id.clone());
-        for issue in validate_node_source(&source) {
+        let mut node_report = validate_node_source(&source);
+        validate_node_with_context(&source, root, path, None, &mut node_report);
+
+        for issue in node_report {
             if report.issues.len() >= BULK_ISSUE_CAP {
                 report.truncated = true;
                 break;

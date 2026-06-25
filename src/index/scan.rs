@@ -96,6 +96,14 @@ impl RoamIndex for ScanIndex {
         Ok(self.nodes.get(id).cloned())
     }
 
+    fn node_by_path(&self, path: &Path) -> IndexResult<Option<NodeMeta>> {
+        Ok(self
+            .nodes
+            .values()
+            .find(|n| n.file == path && n.is_file())
+            .cloned())
+    }
+
     fn backlinks(&self, id: &str) -> IndexResult<Vec<LinkRecord>> {
         Ok(self.backward.get(id).cloned().unwrap_or_default())
     }
@@ -143,6 +151,31 @@ impl RoamIndex for ScanIndex {
             .choose(&mut rng)
             .ok_or_else(|| IndexError::NotFound("index is empty".into()))
             .cloned()
+    }
+
+    fn nodes_with_external_links(&self) -> IndexResult<Vec<(NodeMeta, Vec<LinkRecord>)>> {
+        let mut out = Vec::new();
+        // To stay stable, sort the node IDs first.
+        let mut ids: Vec<&String> = self.forward.keys().collect();
+        ids.sort();
+
+        for id in ids {
+            if let Some(links) = self.forward.get(id) {
+                let external: Vec<LinkRecord> = links
+                    .iter()
+                    .filter(|l| matches!(l.kind.as_str(), "file" | "http" | "https" | "cite"))
+                    .cloned()
+                    .collect();
+                if !external.is_empty() {
+                    if let Some(node) = self.nodes.get(id) {
+                        out.push((node.clone(), external));
+                    }
+                }
+            }
+        }
+        // Final sort by title to match list_nodes / list_orphans behavior.
+        out.sort_by(|a, b| a.0.title.cmp(&b.0.title));
+        Ok(out)
     }
 
     fn orphans(&self) -> IndexResult<Vec<NodeMeta>> {
@@ -838,7 +871,14 @@ fn classify_link(raw: &str) -> (String, Option<String>, Option<String>) {
         return ("roam".to_string(), None, None);
     }
     if raw.starts_with("file:") {
-        return ("file".to_string(), None, None);
+        return (
+            "file".to_string(),
+            None,
+            Some(raw.strip_prefix("file:").unwrap_or(raw).to_string()),
+        );
+    }
+    if raw.starts_with('/') || raw.starts_with("./") || raw.starts_with("../") {
+        return ("file".to_string(), None, Some(raw.to_string()));
     }
     for scheme in ["http", "https"] {
         if raw.starts_with(&format!("{scheme}://")) {

@@ -872,15 +872,24 @@ impl RoamServer {
         query::tag_cooccurrences(&index, &p)
     }
 
+    #[tool(description = "List every node that contains external links (file, http, https, cite)")]
+    async fn list_external_links(
+        &self,
+        p: Parameters<query::ListExternalLinksParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::list_external_links(&index, p)
+    }
+
     #[tool(
-        description = "Validate a node. Pass `body` (raw org text) to check the source against the org-roam spec (returned issues include line/column). Pass `id` to check an existing node against the index (stale :ID:, empty title, dangling id links)."
+        description = "Validate a node. Pass `body` (raw org text) to check the source against the org-roam spec (returned issues include line/column). Pass `id` to check an existing node against the index (stale :ID:, empty title, dangling id links, and broken external links)."
     )]
     async fn validate_node(
         &self,
         p: Parameters<validation_tools::ValidateNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         let index = self.get_index();
-        validation_tools::validate_node(&index, &p)
+        validation_tools::validate_node(&self.config, &index, &p)
     }
 
     #[tool(

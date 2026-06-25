@@ -133,6 +133,18 @@ pub struct TagCooccurrenceParams {
     pub limit: Option<usize>,
 }
 
+/// `list_external_links` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct ListExternalLinksParams {
+    /// Page size. Defaults to 50.
+    #[serde(default)]
+    pub limit: Option<usize>,
+
+    /// Number of nodes to skip. Defaults to 0.
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
 /// `search_nodes` — find org-roam nodes by title / alias / tag.
 ///
 /// # Errors
@@ -727,6 +739,45 @@ pub fn tag_cooccurrences(
         "tag": tag,
         "node_count": nodes.len(),
         "cooccurring": cooccurring,
+    });
+    Ok(json_result(&payload))
+}
+
+/// `list_external_links` — find nodes that contain external links (file, http,
+/// https, cite). Returns a paginated list of nodes along with their external
+/// links.
+///
+/// # Errors
+///
+/// Returns an error if the index query fails.
+pub fn list_external_links(
+    index: &Arc<dyn RoamIndex>,
+    p: Parameters<ListExternalLinksParams>,
+) -> Result<CallToolResult, McpError> {
+    let p = p.0;
+    let nodes = index.nodes_with_external_links().map_err(internal)?;
+    let total = nodes.len();
+    let offset = p.offset.unwrap_or(0);
+    let limit = p.limit.unwrap_or(50);
+
+    let page: Vec<serde_json::Value> = nodes
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(node, links)| {
+            serde_json::json!({
+                "node": node,
+                "external_links": links,
+            })
+        })
+        .collect();
+
+    let payload = serde_json::json!({
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "count": page.len(),
+        "nodes": page,
     });
     Ok(json_result(&payload))
 }
