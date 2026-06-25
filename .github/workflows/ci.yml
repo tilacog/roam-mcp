@@ -24,16 +24,10 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
-      - name: Install just
+      - name: Install tools
         uses: taiki-e/install-action@v2
         with:
-          tool: just
-
-      - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@main
-
-      - name: Install coverage + CRAP tools
-        run: just setup
+          tool: just,cargo-llvm-cov,cargo-crap
 
       - name: Run CI
         run: just ci
