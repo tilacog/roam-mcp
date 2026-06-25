@@ -391,3 +391,60 @@ fn name_reclassification_large_vault_completes_in_time() {
         "indexing 1000 files took {elapsed:?} — likely O(N²) growth"
     );
 }
+
+// ── search_by_tag conformance ────────────────────────────────────────────────
+
+#[test]
+fn scan_search_by_tag_is_exact_and_case_sensitive() {
+    use org_roam_mcp::tools::query::{search_by_tag, SearchByTagParams};
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let idx = ScanIndex::open(&fixture_dir()).expect("open");
+    let idx: std::sync::Arc<dyn RoamIndex> = std::sync::Arc::new(idx);
+
+    let res = search_by_tag(
+        &idx,
+        Parameters(SearchByTagParams {
+            tag: "pastafarianism".to_string(),
+            limit: None,
+            offset: None,
+        }),
+    )
+    .expect("search");
+    let text = res
+        .content
+        .into_iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect::<String>();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["total"], serde_json::json!(1), "got: {v}");
+    assert_eq!(
+        v["nodes"][0]["node_id"],
+        serde_json::json!("11111111-1111-1111-1111-111111111111")
+    );
+
+    // Case-sensitive: an uppercase tag matches nothing, even though the
+    // scanner's own tag filter is case-insensitive (the exact re-filter
+    // in search_by_tag guarantees case-sensitivity across backends).
+    let res = search_by_tag(
+        &idx,
+        Parameters(SearchByTagParams {
+            tag: "PASTAFARIANISM".to_string(),
+            limit: None,
+            offset: None,
+        }),
+    )
+    .expect("search");
+    let text = res
+        .content
+        .into_iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect::<String>();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        v["total"],
+        serde_json::json!(0),
+        "uppercase must not match: {v}"
+    );
+    assert_eq!(v["nodes"], serde_json::json!([]));
+}

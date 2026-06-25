@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::index::RoamIndex;
-use crate::org::{edit, OrgDoc};
+use crate::org::{edit, filetags, OrgDoc};
 use crate::util::{atomic_write, default_filename, remove_file_unlocked, rename_unlocked, slugify};
 use crate::validation;
 
@@ -905,6 +905,199 @@ pub fn add_link(
 
     let payload = serde_json::json!({ "source": p.id, "target": p.target, "link": link });
     Ok(json_result(&payload))
+}
+
+// ── filetag write tools ─────────────────────────────────────────────────────────
+
+/// `add_tag` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AddTagParams {
+    /// The node's :ID:.
+    pub id: String,
+
+    /// Tag(s) to add. Duplicates within this list (and tags already on the
+    /// node) are ignored; the match is exact and case-sensitive.
+    pub tags: Vec<String>,
+}
+
+/// `remove_tag` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RemoveTagParams {
+    /// The node's :ID:.
+    pub id: String,
+
+    /// Tag(s) to remove. Tags not present on the node are silently no-ops.
+    /// The match is exact and case-sensitive.
+    pub tags: Vec<String>,
+}
+
+/// `set_tags` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SetTagParams {
+    /// The node's :ID:.
+    pub id: String,
+
+    /// Complete replacement tag list. An empty list removes all tags.
+    pub tags: Vec<String>,
+}
+
+/// Resolve a node by `:ID:` (file-level or headline both fine - filetags are
+/// file-level) or fail with a standard "node not found" error. Shared by
+/// the filetag write tools to keep each handler's cyclomatic complexity low.
+fn resolve_node(index: &Arc<dyn RoamIndex>, id: &str) -> Result<crate::index::NodeMeta, McpError> {
+    index
+        .node(id)
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        .ok_or_else(|| McpError::invalid_params("node not found", None))
+}
+
+/// Read a node's file text from disk.
+fn read_node_file(node: &crate::index::NodeMeta) -> Result<String, McpError> {
+    std::fs::read_to_string(&node.file)
+        .map_err(|e| McpError::internal_error(format!("{}: {e}", node.file.display()), None))
+}
+
+/// `add_tag` — append one or more tags to a node's `#+filetags:` without
+/// overwriting existing tags. Duplicates (within the request or already on
+/// the node) are not added twice. The match is exact and case-sensitive.
+/// When nothing changes the write is skipped.
+///
+/// # Errors
+///
+/// Returns an error if writes are disabled, the node is not found, or the
+/// file cannot be written.
+pub fn add_tag(
+    cfg: &Config,
+    index: &Arc<dyn RoamIndex>,
+    p: Parameters<AddTagParams>,
+) -> Result<CallToolResult, McpError> {
+    ensure_writable(cfg)?;
+    let p = p.0;
+    let node = resolve_node(index, &p.id)?;
+    let original = read_node_file(&node)?;
+    let current = filetags::file_level_tags(&original);
+    let want = filetags::normalize_tags(&p.tags);
+
+    let mut added: Vec<String> = Vec::new();
+    let mut already_present: Vec<String> = Vec::new();
+    let mut new_tags = current.clone();
+    for tag in &want {
+        if current.iter().any(|t| t == tag) {
+            already_present.push(tag.clone());
+        } else {
+            added.push(tag.clone());
+            new_tags.push(tag.clone());
+        }
+    }
+
+    if new_tags == current {
+        return Ok(json_result(&serde_json::json!({
+            "id": p.id,
+            "file": node.file,
+            "added": added,
+            "already_present": already_present,
+            "tags": new_tags,
+        })));
+    }
+    rewrite_file(&node.file, |text| {
+        filetags::apply_file_tags(text, &new_tags);
+        Ok(())
+    })?;
+    Ok(json_result(&serde_json::json!({
+        "id": p.id,
+        "file": node.file,
+        "added": added,
+        "already_present": already_present,
+        "tags": new_tags,
+    })))
+}
+
+/// `remove_tag` — remove one or more tags from a node's `#+filetags:`.
+/// Tags not present are silently ignored (no-op). The match is exact and
+/// case-sensitive. When nothing changes the write is skipped.
+///
+/// # Errors
+///
+/// Returns an error if writes are disabled, the node is not found, or the
+/// file cannot be written.
+pub fn remove_tag(
+    cfg: &Config,
+    index: &Arc<dyn RoamIndex>,
+    p: Parameters<RemoveTagParams>,
+) -> Result<CallToolResult, McpError> {
+    ensure_writable(cfg)?;
+    let p = p.0;
+    let node = resolve_node(index, &p.id)?;
+    let original = read_node_file(&node)?;
+    let current = filetags::file_level_tags(&original);
+    let want = filetags::normalize_tags(&p.tags);
+
+    let mut removed: Vec<String> = Vec::new();
+    let mut new_tags: Vec<String> = Vec::new();
+    for tag in &current {
+        if want.iter().any(|t| t == tag) {
+            removed.push(tag.clone());
+        } else {
+            new_tags.push(tag.clone());
+        }
+    }
+
+    if new_tags == current {
+        return Ok(json_result(&serde_json::json!({
+            "id": p.id,
+            "file": node.file,
+            "removed": removed,
+            "tags": new_tags,
+        })));
+    }
+    rewrite_file(&node.file, |text| {
+        filetags::apply_file_tags(text, &new_tags);
+        Ok(())
+    })?;
+    Ok(json_result(&serde_json::json!({
+        "id": p.id,
+        "file": node.file,
+        "removed": removed,
+        "tags": new_tags,
+    })))
+}
+
+/// `set_tags` — replace a node's entire `#+filetags:` set. An empty list
+/// removes all tags (and the keyword). When the new set equals the current
+/// set the write is skipped to avoid needless IO.
+///
+/// # Errors
+///
+/// Returns an error if writes are disabled, the node is not found, or the
+/// file cannot be written.
+pub fn set_tags(
+    cfg: &Config,
+    index: &Arc<dyn RoamIndex>,
+    p: Parameters<SetTagParams>,
+) -> Result<CallToolResult, McpError> {
+    ensure_writable(cfg)?;
+    let p = p.0;
+    let node = resolve_node(index, &p.id)?;
+    let original = read_node_file(&node)?;
+    let current = filetags::file_level_tags(&original);
+    let new_tags = filetags::normalize_tags(&p.tags);
+
+    if new_tags == current {
+        return Ok(json_result(&serde_json::json!({
+            "id": p.id,
+            "file": node.file,
+            "tags": new_tags,
+        })));
+    }
+    rewrite_file(&node.file, |text| {
+        filetags::apply_file_tags(text, &new_tags);
+        Ok(())
+    })?;
+    Ok(json_result(&serde_json::json!({
+        "id": p.id,
+        "file": node.file,
+        "tags": new_tags,
+    })))
 }
 
 // ── daily reads ─────────────────────────────────────────────────────────────

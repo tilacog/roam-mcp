@@ -675,80 +675,10 @@ fn outline_path(h: &orgize::ast::Headline) -> Vec<String> {
     path
 }
 
-/// Trimmed values of every `#+key:` keyword line in `text`, matching the
-/// key case-insensitively.
-pub(crate) fn keyword_values<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let Some(rest) = line.trim_start().strip_prefix("#+") else {
-            continue;
-        };
-        let Some((k, v)) = rest.split_once(':') else {
-            continue;
-        };
-        if k.eq_ignore_ascii_case(key) {
-            out.push(v.trim());
-        }
-    }
-    out
-}
-
-/// File-level tags: `#+filetags: :a:b:` plus the org-roam v1 form
-/// `#+ROAM_TAGS: a b "multi word"`. Duplicates removed, order preserved.
-fn file_level_tags(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for v in keyword_values(text, "filetags") {
-        out.extend(parse_filetags_value(v));
-    }
-    for v in keyword_values(text, "roam_tags") {
-        out.extend(parse_string_list(v));
-    }
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|t| seen.insert(t.clone()));
-    out
-}
-
-fn parse_filetags_value(s: &str) -> Vec<String> {
-    // `#+filetags: :work:urgent:` → ["work", "urgent"]
-    s.split(':')
-        .map(|x| x.trim().to_string())
-        .filter(|x| !x.is_empty())
-        .collect()
-}
-
-pub(crate) fn parse_string_list(s: &str) -> Vec<String> {
-    // `ROAM_ALIASES: "A" "B"` and `ROAM_REFS: https://... @key` both
-    // can be tokenized by splitting on whitespace, then re-joining quoted
-    // runs.
-    let mut out = Vec::new();
-    let mut buf = String::new();
-    let mut in_str = false;
-    for c in s.chars() {
-        match c {
-            '"' => {
-                if in_str {
-                    out.push(std::mem::take(&mut buf));
-                } else {
-                    buf.clear();
-                }
-                in_str = !in_str;
-            }
-            c if c.is_whitespace() && !in_str => {
-                if !buf.is_empty() {
-                    out.push(std::mem::take(&mut buf));
-                }
-            }
-            c => buf.push(c),
-        }
-    }
-    if !buf.is_empty() {
-        out.push(buf);
-    }
-    out.into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
+// Filetag parsing lives in `crate::org::filetags` so the MCP tools and
+// both index backends share the exact same behaviour. Re-exported here
+// for the existing callers and tests that still reach through `scan`.
+pub(crate) use crate::org::filetags::{file_level_tags, keyword_values, parse_string_list};
 
 fn push_link(l: &Link, source_id: &str, out: &mut Vec<LinkRecord>) {
     let raw = l.path().to_string();

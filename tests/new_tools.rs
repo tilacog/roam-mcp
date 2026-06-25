@@ -595,9 +595,12 @@ async fn read_only_mode_rejects_new_write_tools() {
             "rename_node",
             "prepend_to_node",
             "add_link",
+            "add_tag",
+            "remove_tag",
+            "set_tags",
         ] {
             let params = CallToolRequestParams::new(tool.to_string()).with_arguments(
-                object!({ "id": "x", "title": "y", "content": "z", "target": "t" }),
+                object!({ "id": "x", "title": "y", "content": "z", "target": "t", "tags": [] }),
             );
             let res = peer.call_tool(params).await;
             assert!(res.is_err(), "{tool} must be rejected in read-only mode");
@@ -905,6 +908,170 @@ async fn unlinked_references_does_not_match_inside_links() {
         assert!(
             !in_linked,
             "alias match inside `[[...]]` must be filtered out, got: {arr:?}"
+        );
+    })
+    .await;
+}
+
+// ── filetag management tools ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn add_remove_set_list_has_tag_round_trip() {
+    let dir = TempDir::new().unwrap();
+    run(server(&dir, false), |peer| async move {
+        let (id, file) = create(
+            &peer,
+            object!({ "title": "Tagged Note", "tags": ["alpha"] }),
+        )
+        .await;
+
+        // add_tag appends new tags and dedupes the already-present one.
+        let res = call(
+            &peer,
+            "add_tag",
+            object!({ "id": id, "tags": ["beta", "alpha"] }),
+        )
+        .await;
+        assert_eq!(res["added"], Value::Array(vec!["beta".into()]));
+        assert_eq!(res["already_present"], Value::Array(vec!["alpha".into()]));
+        assert_eq!(
+            res["tags"],
+            Value::Array(vec!["alpha".into(), "beta".into()])
+        );
+
+        // list_node_tags reflects on-disk tags.
+        let res = call(&peer, "list_node_tags", object!({ "id": id })).await;
+        assert_eq!(
+            res["tags"],
+            Value::Array(vec!["alpha".into(), "beta".into()])
+        );
+
+        // has_tag is exact + case-sensitive.
+        let res = call(&peer, "has_tag", object!({ "id": id, "tag": "alpha" })).await;
+        assert_eq!(res["has"], Value::Bool(true));
+        let res = call(&peer, "has_tag", object!({ "id": id, "tag": "ALPHA" })).await;
+        assert_eq!(res["has"], Value::Bool(false));
+
+        // The file on disk carries the colon-delimited keyword.
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains("#+filetags: :alpha:beta:"),
+            "filetags not written: {text}"
+        );
+
+        // remove_tag drops a tag, silently no-ops on an absent one.
+        let res = call(
+            &peer,
+            "remove_tag",
+            object!({ "id": id, "tags": ["beta", "missing"] }),
+        )
+        .await;
+        assert_eq!(res["removed"], Value::Array(vec!["beta".into()]));
+        assert_eq!(res["tags"], Value::Array(vec!["alpha".into()]));
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("#+filetags: :alpha:"), "after remove: {text}");
+
+        // set_tags replaces the whole set; empty clears it.
+        let res = call(
+            &peer,
+            "set_tags",
+            object!({ "id": id, "tags": ["x", "y", "y"] }),
+        )
+        .await;
+        assert_eq!(res["tags"], Value::Array(vec!["x".into(), "y".into()]));
+        let res = call(&peer, "set_tags", object!({ "id": id, "tags": [] })).await;
+        assert_eq!(res["tags"], Value::Array(vec![]));
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(!text.contains("#+filetags"), "keyword not removed: {text}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn search_by_tag_is_exact_and_case_sensitive() {
+    let dir = TempDir::new().unwrap();
+    run(server(&dir, false), |peer| async move {
+        create(
+            &peer,
+            object!({ "title": "Zebra Node", "tags": ["solana"] }),
+        )
+        .await;
+        create(
+            &peer,
+            object!({ "title": "Alpha Node", "tags": ["solana"] }),
+        )
+        .await;
+        create(&peer, object!({ "title": "Other", "tags": ["different"] })).await;
+
+        let res = call(&peer, "search_by_tag", object!({ "tag": "solana" })).await;
+        // Sorted by title ascending (case-insensitive): Alpha, Zebra.
+        let titles: Vec<Value> = res["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["title"].clone())
+            .collect();
+        assert_eq!(
+            titles,
+            vec![
+                Value::String("Alpha Node".into()),
+                Value::String("Zebra Node".into())
+            ],
+            "got: {res}"
+        );
+        assert_eq!(res["total"], Value::Number(2.into()));
+
+        // Case-sensitive: "SOLANA" matches nothing.
+        let res = call(&peer, "search_by_tag", object!({ "tag": "SOLANA" })).await;
+        assert_eq!(res["total"], Value::Number(0.into()));
+        assert_eq!(res["nodes"], Value::Array(vec![]));
+
+        // Pagination.
+        let res = call(
+            &peer,
+            "search_by_tag",
+            object!({ "tag": "solana", "limit": 1 }),
+        )
+        .await;
+        assert_eq!(res["count"], Value::Number(1.into()));
+        let res = call(
+            &peer,
+            "search_by_tag",
+            object!({ "tag": "solana", "offset": 1 }),
+        )
+        .await;
+        assert_eq!(res["count"], Value::Number(1.into()));
+        assert_eq!(res["nodes"][0]["title"], Value::String("Zebra Node".into()));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn filetag_tools_reject_unknown_node_and_read_only_mode() {
+    let dir = TempDir::new().unwrap();
+    // Read-only server: write tools are gone from the router.
+    run(server(&dir, true), |peer| async move {
+        // add_tag is a write tool -> removed in read-only mode.
+        let res = peer
+            .call_tool(CallToolRequestParams::new("add_tag".to_string()))
+            .await;
+        assert!(
+            res.is_err(),
+            "add_tag must be unavailable in read-only mode"
+        );
+
+        // list_node_tags stays available, but an unknown id errors with
+        // "node not found" rather than returning a payload.
+        let res = peer
+            .call_tool(
+                CallToolRequestParams::new("list_node_tags".to_string())
+                    .with_arguments(object!({ "id": "does-not-exist" })),
+            )
+            .await;
+        assert!(res.is_err(), "list_node_tags must error on unknown id");
+        assert!(
+            res.unwrap_err().to_string().contains("node not found"),
+            "expected node-not-found error"
         );
     })
     .await;

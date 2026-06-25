@@ -8,6 +8,7 @@
 
 pub mod anchors;
 pub mod edit;
+pub mod filetags;
 pub mod parse;
 
 pub use anchors::AnchorResolver;

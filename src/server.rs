@@ -68,6 +68,9 @@ const WRITE_TOOLS: &[&str] = &[
     "delete_node",
     "rename_node",
     "add_link",
+    "add_tag",
+    "remove_tag",
+    "set_tags",
 ];
 
 /// The org-roam MCP server.
@@ -1054,6 +1057,79 @@ impl RoamServer {
         self.syncer.schedule();
         Ok(result)
     }
+
+    #[tool(
+        description = "List the file-level #+filetags: (plus v1 #+ROAM_TAGS:) tags on a node, read from disk"
+    )]
+    async fn list_node_tags(
+        &self,
+        p: Parameters<query::ListNodeTagsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::list_node_tags(&index, &p)
+    }
+
+    #[tool(
+        description = "Check whether a node has a specific #+filetags: tag (exact, case-sensitive)"
+    )]
+    async fn has_tag(
+        &self,
+        p: Parameters<query::HasTagParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::has_tag(&index, &p)
+    }
+
+    #[tool(
+        description = "Find nodes whose file-level tags include a given tag (exact, case-sensitive), with pagination"
+    )]
+    async fn search_by_tag(
+        &self,
+        p: Parameters<query::SearchByTagParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        query::search_by_tag(&index, p)
+    }
+
+    #[tool(
+        description = "Add one or more tags to a node's #+filetags: without overwriting existing tags (dedup, case-sensitive)"
+    )]
+    async fn add_tag(
+        &self,
+        p: Parameters<write_tools::AddTagParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        let result = write_tools::add_tag(&self.config, &index, p)?;
+        self.refresh_index_after_write();
+        self.syncer.schedule();
+        Ok(result)
+    }
+
+    #[tool(
+        description = "Remove one or more tags from a node's #+filetags:; absent tags are silently ignored (case-sensitive)"
+    )]
+    async fn remove_tag(
+        &self,
+        p: Parameters<write_tools::RemoveTagParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        let result = write_tools::remove_tag(&self.config, &index, p)?;
+        self.refresh_index_after_write();
+        self.syncer.schedule();
+        Ok(result)
+    }
+
+    #[tool(description = "Replace a node's entire #+filetags: set; an empty list removes all tags")]
+    async fn set_tags(
+        &self,
+        p: Parameters<write_tools::SetTagParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let index = self.get_index();
+        let result = write_tools::set_tags(&self.config, &index, p)?;
+        self.refresh_index_after_write();
+        self.syncer.schedule();
+        Ok(result)
+    }
 }
 
 // ── Prompt dispatch ───────────────────────────────────────────────────────────
@@ -1279,10 +1355,12 @@ impl ServerHandler for RoamServer {
                  list_nodes, list_orphans, search_text, get_node, get_node_by_path, \
                  get_node_section, get_backlinks, get_forward_links, find_by_ref, get_refs, \
                  list_tags, tag_cooccurrences, list_anchors, unlinked_references, \
-                 validate_node, get_daily_note, list_dailies, server_info, sync_database. \
+                 list_node_tags, has_tag, search_by_tag, validate_node, get_daily_note, \
+                 list_dailies, server_info, sync_database. \
                  Write tools (removed in --read-only): create_node, update_node, delete_node, \
                  rename_node, append_to_node, prepend_to_node, add_link, insert_anchor, \
-                 daily_capture. Resources: org-roam://node/{id}. \
+                 daily_capture, add_tag, remove_tag, set_tags. \
+                 Resources: org-roam://node/{id}. \
                  Prompts: summarize-node, link-suggestions, orphan-triage, tag-suggestions."
                     .to_string(),
             )

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::index::scan::{keyword_values, parse_string_list};
 use crate::index::{NodeMeta, NodeQuery, RoamIndex};
+use crate::org::filetags::file_level_tags;
 use crate::org::OrgDoc;
 use crate::tools::content::read_node_body;
 use orgize::ast::Headline as OrgHeadline;
@@ -1007,6 +1008,156 @@ pub fn list_files(
         "limit": limit,
         "count": page.len(),
         "files": page,
+    });
+    Ok(json_result(&payload))
+}
+
+// ── filetag read tools ──────────────────────────────────────────────────────────
+
+/// `list_node_tags` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ListNodeTagsParams {
+    /// The node's :ID:.
+    pub id: String,
+}
+
+/// `has_tag` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HasTagParams {
+    /// The node's :ID:.
+    pub id: String,
+
+    /// The tag to check for (case-sensitive, exact match).
+    pub tag: String,
+}
+
+/// `search_by_tag` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct SearchByTagParams {
+    /// The tag to search for (case-sensitive, exact match).
+    pub tag: String,
+
+    /// Maximum number of results to return. Defaults to 100.
+    #[serde(default)]
+    pub limit: Option<usize>,
+
+    /// Number of results to skip before the page. Defaults to 0.
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+/// Resolve a node by `:ID:` or fail with a standard "node not found" error.
+/// Kept tiny (low cyclomatic complexity) so the read tools share one
+/// not-found path without inflating their CRAP scores.
+fn resolve_node(index: &Arc<dyn RoamIndex>, id: &str) -> Result<NodeMeta, McpError> {
+    index
+        .node(id)
+        .map_err(internal)?
+        .ok_or_else(|| McpError::invalid_params("node not found", None))
+}
+
+/// Read a node's file text from disk.
+fn read_node_file(node: &NodeMeta) -> Result<String, McpError> {
+    std::fs::read_to_string(&node.file)
+        .map_err(|e| McpError::internal_error(format!("{}: {e}", node.file.display()), None))
+}
+
+/// `list_node_tags` — return the file-level `#+filetags:` (plus v1
+/// `#+ROAM_TAGS:`) tags on a node, read from disk so on-disk truth wins.
+/// Works for file-level and headline nodes (filetags are file-level).
+///
+/// # Errors
+///
+/// Returns an error if the node is not found or its file cannot be read.
+pub fn list_node_tags(
+    index: &Arc<dyn RoamIndex>,
+    p: &Parameters<ListNodeTagsParams>,
+) -> Result<CallToolResult, McpError> {
+    let node = resolve_node(index, &p.0.id)?;
+    let text = read_node_file(&node)?;
+    let tags = file_level_tags(&text);
+    Ok(json_result(&serde_json::json!({
+        "id": p.0.id,
+        "file": node.file,
+        "tags": tags,
+    })))
+}
+
+/// `has_tag` — whether a node carries `tag`, read from disk. The match is
+/// exact and case-sensitive.
+///
+/// # Errors
+///
+/// Returns an error if the node is not found or its file cannot be read.
+pub fn has_tag(
+    index: &Arc<dyn RoamIndex>,
+    p: &Parameters<HasTagParams>,
+) -> Result<CallToolResult, McpError> {
+    let node = resolve_node(index, &p.0.id)?;
+    let text = read_node_file(&node)?;
+    let has = file_level_tags(&text).iter().any(|t| t == &p.0.tag);
+    Ok(json_result(&serde_json::json!({
+        "id": p.0.id,
+        "file": node.file,
+        "tag": p.0.tag,
+        "has": has,
+    })))
+}
+
+/// `search_by_tag` — find nodes whose file-level tags include `tag`. The
+/// match is exact and case-sensitive regardless of backend (the scanner is
+/// case-insensitive in its tag filter, so an exact re-filter is applied to
+/// guarantee it). Results are sorted by title (case-insensitive, ascending).
+///
+/// # Errors
+///
+/// Returns an error if the index query fails. An empty result is not an
+/// error — it returns an empty array.
+pub fn search_by_tag(
+    index: &Arc<dyn RoamIndex>,
+    p: Parameters<SearchByTagParams>,
+) -> Result<CallToolResult, McpError> {
+    let p = p.0;
+    let limit = p.limit.unwrap_or(100);
+    let offset = p.offset.unwrap_or(0);
+
+    let candidates = index
+        .find_nodes(&NodeQuery {
+            query: None,
+            tags: std::slice::from_ref(&p.tag),
+            limit: None,
+        })
+        .map_err(internal)?;
+
+    // Exact, case-sensitive re-filter so the result is independent of the
+    // backend's tag-matching rules (the scanner's tag filter is
+    // case-insensitive).
+    let mut hits: Vec<NodeMeta> = candidates
+        .into_iter()
+        .filter(|n| n.tags.iter().any(|t| t == &p.tag))
+        .collect();
+    hits.sort_by_key(|a| a.title.to_lowercase());
+
+    let total = hits.len();
+    let page: Vec<serde_json::Value> = hits
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|n| {
+            serde_json::json!({
+                "node_id": n.id,
+                "title": n.title,
+                "file": n.file,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "tag": p.tag,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "count": page.len(),
+        "nodes": page,
     });
     Ok(json_result(&payload))
 }

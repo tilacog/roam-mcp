@@ -31,10 +31,12 @@ MCP. The 27 tools split into three groups:
   `get_node_section`, `get_backlinks`, `get_forward_links`,
   `find_by_ref`, `get_refs`, `list_tags`, `tag_cooccurrences`,
   `list_anchors`, `unlinked_references`, `validate_node`,
+  `list_node_tags`, `has_tag`, `search_by_tag`,
   `get_daily_note`, `list_dailies`, `server_info`, `sync_database`.
 - **Write** (removed in `--read-only` mode): `create_node`,
   `update_node`, `delete_node`, `rename_node`, `append_to_node`,
-  `prepend_to_node`, `add_link`, `insert_anchor`, `daily_capture`.
+  `prepend_to_node`, `add_link`, `insert_anchor`, `daily_capture`,
+  `add_tag`, `remove_tag`, `set_tags`.
 - **Resources & prompts**: `org-roam://node/{id}` (+ `#anchor`),
   `summarize-node`, `link-suggestions`, `orphan-triage`,
   `tag-suggestions`.
@@ -411,6 +413,9 @@ not the full schema.
 | `get_refs` | `id` | The `ROAM_REFS` (and v1 `ROAM_KEY`) declared by a node |
 | `list_tags` | — | Tag → count of nodes |
 | `tag_cooccurrences` | `tag`, `limit` | For nodes bearing `tag`, which other tags appear with it |
+| `list_node_tags` | `id` | File-level `#+filetags:` (+ v1 `#+ROAM_TAGS:`) tags, read from disk |
+| `has_tag` | `id`, `tag` | Boolean; exact, case-sensitive |
+| `search_by_tag` | `tag`, `limit`, `offset` | Nodes bearing `tag` (exact, case-sensitive), paged |
 | `list_anchors` | `id` | `<<target>>`s, headlines, `CUSTOM_ID`s in a node |
 | `unlinked_references` | `id`, `limit` | Plain-text mentions of a node's title/aliases |
 | `validate_node` | `id` | Structural issues (stale id, empty title, dangling links) |
