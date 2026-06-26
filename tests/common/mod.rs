@@ -31,6 +31,31 @@ pub fn prompt_text(result: &rmcp::model::GetPromptResult) -> String {
         .join("\n")
 }
 
+/// Resume a panic from a spawned task, or report a non-panic `JoinError`.
+fn resume_task_panic(error: tokio::task::JoinError, label: &str) {
+    if error.is_panic() {
+        std::panic::resume_unwind(error.into_panic());
+    }
+    panic!("{label} task failed: {error}");
+}
+
+/// Await a `JoinHandle` and propagate any panic.
+async fn await_joined(handle: tokio::task::JoinHandle<()>, label: &'static str) {
+    if let Err(e) = handle.await {
+        resume_task_panic(e, label);
+    }
+}
+
+/// Unwrap a timeout-wrapped client result and propagate any panic.
+fn unwrap_client_result(
+    result: Result<Result<(), tokio::task::JoinError>, tokio::time::error::Elapsed>,
+) {
+    let joined = result.unwrap_or_else(|_| panic!("test timed out after 10s"));
+    if let Err(e) = joined {
+        resume_task_panic(e, "client");
+    }
+}
+
 /// Serve `server` in-process and run `test_fn` against it as a client.
 ///
 /// Panics from `test_fn` (and timeouts) propagate and fail the test —
@@ -48,9 +73,11 @@ where
     let server_handle = tokio::spawn(async move {
         // Keep the running service alive until the test ends — dropping
         // it tears the transport down and every client call fails.
-        if let Ok(running) = server.serve((a_to_b, b_read)).await {
-            let _ = running.waiting().await;
-        }
+        let running = server
+            .serve((a_to_b, b_read))
+            .await
+            .expect("server failed to start");
+        let _ = running.waiting().await;
     });
 
     // Wait briefly for the server task to come up.
@@ -64,15 +91,8 @@ where
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), client_handle).await;
     server_handle.abort();
-    let _ = server_handle.await;
-    // Surface what happened inside the spawned task — a swallowed panic
-    // here would turn every assertion in `test_fn` into a no-op.
-    let Ok(joined) = result else {
-        panic!("test timed out after 10s");
-    };
-    match joined {
-        Ok(()) => {}
-        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-        Err(e) => panic!("client task failed: {e}"),
-    }
+    // Surface what happened inside the spawned tasks — a swallowed panic
+    // on either side would turn every assertion in `test_fn` into a no-op.
+    await_joined(server_handle, "server").await;
+    unwrap_client_result(result);
 }

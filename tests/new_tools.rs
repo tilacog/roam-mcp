@@ -10,6 +10,7 @@
 mod common;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rmcp::model::CallToolRequestParams;
 use rmcp::object;
@@ -19,6 +20,8 @@ use serde_json::{Map, Value};
 use tempfile::TempDir;
 
 use common::{run_with_server, run_with_server as run, text_of};
+use org_roam_mcp::index::scan::ScanIndex;
+use org_roam_mcp::sync::SyncMode;
 use org_roam_mcp::{Config, RoamServer};
 
 /// Call a tool and parse its (JSON) text payload.
@@ -42,8 +45,14 @@ async fn create(peer: &Peer<RoleClient>, args: Map<String, Value>) -> (String, P
 }
 
 fn server(dir: &TempDir, read_only: bool) -> RoamServer {
-    let cfg = Config::from_args(dir.path(), read_only, true, None).unwrap();
-    RoamServer::new(cfg).unwrap()
+    // Use `with_index` and disable db-sync so these tests are isolated
+    // from the host Emacs setup and the file watcher. Writes call
+    // `refresh_index_after_write` themselves, so the in-process scanner
+    // stays up to date without background sync/watcher activity.
+    let mut cfg = Config::from_args(dir.path(), read_only, true, None).unwrap();
+    cfg.sync_mode = SyncMode::Never;
+    let index = Arc::new(ScanIndex::open(dir.path()).expect("scan empty test dir"));
+    RoamServer::with_index(cfg, index)
 }
 
 #[tokio::test]
