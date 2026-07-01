@@ -1,14 +1,17 @@
 //! Emacs integration test for the native DB populator.
 //!
-//! Verifies that a database built by `populate_database` can be synced and read
-//! by Emacs org-roam. This test is gated by the `emacs-tests` feature and
-//! auto-skips when Emacs or org-roam are not installed.
+//! Verifies that a database built by `populate_database` can be read
+//! directly by Emacs org-roam, without Emacs rebuilding it. This test is
+//! gated by the `emacs-tests` feature and auto-skips when Emacs or org-roam
+//! are not installed.
 
 #![cfg(feature = "emacs-tests")]
 
+use std::fs;
 use std::path::PathBuf;
 
 use org_roam_mcp::index::populate::{populate_database, PopulateOptions};
+use sha1::Digest;
 
 mod emacs_helper;
 
@@ -17,6 +20,21 @@ fn populate_dir() -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join("sample-vault")
+}
+
+fn file_hash(path: &std::path::Path) -> String {
+    use std::io::Read;
+    let mut file = fs::File::open(path).expect("open db for hashing");
+    let mut hasher = sha1::Sha1::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf).expect("read db for hashing");
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 #[test]
@@ -46,6 +64,11 @@ fn emacs_reads_populated_db() {
     // Pick a known node from the sample vault to verify in Emacs.
     let target_id = "11111111-1111-1111-1111-111111111111";
 
+    // Remember the exact DB bytes. Emacs must not modify the DB while
+    // reading it; if it syncs/rebuilds, the hash will change and the test
+    // fails.
+    let hash_before = file_hash(&db_path);
+
     let output = emacs_helper::run_emacs_script(
         &vault,
         &db_path,
@@ -57,6 +80,12 @@ fn emacs_reads_populated_db() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         panic!("Emacs verification failed:\nstdout:\n{stdout}\nstderr:\n{stderr}");
     }
+
+    let hash_after = file_hash(&db_path);
+    assert_eq!(
+        hash_before, hash_after,
+        "Emacs modified the database; org-roam-db-sync should not have run"
+    );
 
     let line = emacs_helper::last_stdout_line(&output);
     let value: serde_json::Value = serde_json::from_str(&line)

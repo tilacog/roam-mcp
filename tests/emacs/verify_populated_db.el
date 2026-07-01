@@ -1,17 +1,22 @@
 ;;; verify_populated_db.el --- verify org-roam can read a Rust-populated DB  -*- lexical-binding: t -*-
 
 ;; Inputs (set via --eval before --load):
-;;   org-roam-directory  - directory containing the .org files
-;;   org-roam-db-location - path to the Rust-created org-roam.db
-;;   target-node-id      - ID we expect org-roam to find
+;;   org-roam-directory     - directory containing the .org files
+;;   org-roam-db-location   - path to the Rust-created org-roam.db
+;;   target-node-id         - ID we expect org-roam to find
+
+;; IMPORTANT: this script intentionally does NOT call org-roam-db-sync.
+;; The whole point is to check that org-roam can consume the database
+;; produced by the Rust populator as-is, without Emacs rebuilding it.
 
 (require 'package)
 (package-initialize)
 (require 'json)
 (require 'org-roam)
 
-;; org-roam-db-sync reads the existing DB and reconciles it against disk.
-(org-roam-db-sync)
+;; Disable automatic background sync so nothing modifies the DB.
+(when org-roam-db-autosync-mode
+  (org-roam-db-autosync-mode -1))
 
 (let ((node (org-roam-node-from-id target-node-id)))
   (if (null node)
