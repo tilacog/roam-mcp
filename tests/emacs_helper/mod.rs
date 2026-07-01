@@ -136,13 +136,17 @@ pub fn run_emacs_script(
         .expect("failed to run Emacs")
 }
 
-/// Read the last non-empty line of Emacs stdout. Emacs package init can print
-/// warnings before our script's output; the last line is the JSON we asked for.
+/// Read the last non-empty line of Emacs stdout, stripped of leading
+/// control characters and whitespace. Emacs package init can print warnings
+/// and even a stray BEL character before our script's JSON output.
 pub fn last_stdout_line(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout)
+    let line = String::from_utf8_lossy(&output.stdout)
         .lines()
         .rfind(|l| !l.trim().is_empty())
         .unwrap_or("")
+        .to_string();
+    line.trim_start()
+        .trim_start_matches(|c: char| c.is_ascii_control())
         .to_string()
 }
 
