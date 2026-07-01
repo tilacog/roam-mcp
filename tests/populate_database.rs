@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use org_roam_mcp::index::populate::{populate_database, PopulateOptions};
 use org_roam_mcp::index::sqlite::SqliteIndex;
 use org_roam_mcp::index::{NodeQuery, RoamIndex};
+use rusqlite::Connection;
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -117,4 +118,80 @@ fn populate_preserves_links_and_refs() {
     let by_url = idx.by_ref("https://example.com").unwrap();
     assert_eq!(by_url.len(), 1);
     assert_eq!(by_url[0].id, "aaaa1111-1111-1111-1111-111111111111");
+}
+
+#[test]
+fn populate_stores_link_and_citation_positions() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("org-roam.db");
+    let options = PopulateOptions {
+        db_path: db_path.clone(),
+        overwrite: false,
+    };
+
+    let vault = dir.path().join("vault");
+    std::fs::create_dir(&vault).unwrap();
+    std::fs::write(
+        vault.join("a.org"),
+        ":PROPERTIES:\n\
+         :ID: aaaa1111-1111-1111-1111-111111111111\n\
+         :END:\n\
+         #+title: Alpha\n\n\
+         Link to [[id:bbbb2222-2222-2222-2222-222222222222]].\n\
+         [cite:@nora2023]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        vault.join("b.org"),
+        ":PROPERTIES:\n\
+         :ID: bbbb2222-2222-2222-2222-222222222222\n\
+         :END:\n\
+         #+title: Beta\n",
+    )
+    .unwrap();
+
+    let stats = populate_database(&vault, &options).expect("populate vault with positions");
+    assert_eq!(stats.links, 2);
+    assert_eq!(stats.citations, 1);
+
+    let conn = Connection::open(&db_path).unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT pos, type FROM links WHERE source = ? ORDER BY pos")
+        .unwrap();
+    let rows: Vec<(i64, String)> = stmt
+        .query_map(["\"aaaa1111-1111-1111-1111-111111111111\""], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    let id_link = rows.iter().find(|(_, t)| t == "\"id\"").unwrap();
+    let cite_link = rows.iter().find(|(_, t)| t == "\"cite\"").unwrap();
+    assert!(id_link.0 > 0, "id link position should be positive");
+    assert!(cite_link.0 > 0, "cite link position should be positive");
+    assert!(cite_link.0 > id_link.0, "citation comes after the id link");
+
+    let cite_pos: i64 = conn
+        .query_row(
+            "SELECT pos FROM citations WHERE node_id = ? AND cite_key = ?",
+            ["\"aaaa1111-1111-1111-1111-111111111111\"", "\"nora2023\""],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        cite_pos, cite_link.0,
+        "citation table position matches the link"
+    );
+
+    let file_pos: i64 = conn
+        .query_row(
+            "SELECT pos FROM nodes WHERE id = ?",
+            ["\"aaaa1111-1111-1111-1111-111111111111\""],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(file_pos, 1, "file-level node position matches org-roam");
 }

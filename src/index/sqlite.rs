@@ -297,14 +297,15 @@ impl RoamIndex for SqliteIndex {
         }
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare("SELECT source, dest, type FROM links WHERE dest = ?")
+            .prepare("SELECT source, dest, type, pos FROM links WHERE dest = ?")
             .map_err(IndexError::Sqlite)?;
         let rows = stmt
             .query_map([emacsql::quote(id)], |r| {
                 let source: String = r.get(0)?;
                 let dest: String = r.get(1)?;
                 let kind: Option<String> = r.get(2)?;
-                Ok(link_record(&source, &dest, kind.as_deref()))
+                let pos: Option<i64> = r.get(3)?;
+                Ok(link_record(&source, &dest, kind.as_deref(), pos))
             })
             .map_err(IndexError::Sqlite)?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -318,14 +319,15 @@ impl RoamIndex for SqliteIndex {
         if self.has_columns("links", &["source", "dest", "type"]) {
             let conn = self.lock()?;
             let mut stmt = conn
-                .prepare("SELECT source, dest, type FROM links WHERE source = ?")
+                .prepare("SELECT source, dest, type, pos FROM links WHERE source = ?")
                 .map_err(IndexError::Sqlite)?;
             let rows = stmt
                 .query_map([emacsql::quote(id)], |r| {
                     let source: String = r.get(0)?;
                     let dest: String = r.get(1)?;
                     let kind: Option<String> = r.get(2)?;
-                    Ok(link_record(&source, &dest, kind.as_deref()))
+                    let pos: Option<i64> = r.get(3)?;
+                    Ok(link_record(&source, &dest, kind.as_deref(), pos))
                 })
                 .map_err(IndexError::Sqlite)?;
             out.extend(
@@ -339,18 +341,24 @@ impl RoamIndex for SqliteIndex {
         // `cite` LinkRecord with no node destination (same shape as the
         // scanner backend's in-body citation records).
         if self.has_columns("citations", &["node_id", "cite_key"]) {
+            let has_pos = self.has_columns("citations", &["pos"]);
             let conn = self.lock()?;
             let mut stmt = conn
-                .prepare("SELECT cite_key FROM citations WHERE node_id = ?")
+                .prepare(if has_pos {
+                    "SELECT cite_key, pos FROM citations WHERE node_id = ?"
+                } else {
+                    "SELECT cite_key, NULL FROM citations WHERE node_id = ?"
+                })
                 .map_err(IndexError::Sqlite)?;
             let rows = stmt
                 .query_map([emacsql::quote(id)], |r| {
                     let cite_key: String = r.get(0)?;
-                    Ok(emacsql::decode(&cite_key))
+                    let pos: Option<i64> = r.get(1)?;
+                    Ok((emacsql::decode(&cite_key), pos))
                 })
                 .map_err(IndexError::Sqlite)?;
             for row in rows {
-                let key = row.map_err(IndexError::Sqlite)?;
+                let (key, pos) = row.map_err(IndexError::Sqlite)?;
                 let raw_dest = format!("@{key}");
                 out.push(LinkRecord {
                     source: id.to_string(),
@@ -358,6 +366,7 @@ impl RoamIndex for SqliteIndex {
                     raw_dest: raw_dest.clone(),
                     kind: "cite".to_string(),
                     ref_target: Some(raw_dest),
+                    pos: pos.map(|p| usize::try_from(p).unwrap_or(0)),
                 });
             }
         }
@@ -568,7 +577,7 @@ impl RoamIndex for SqliteIndex {
             let conn = self.lock()?;
             let mut stmt = conn
                 .prepare(&format!(
-                    "SELECT source, dest, type FROM links \
+                    "SELECT source, dest, type, pos FROM links \
                      WHERE type IN ('{}', '{}', '{}', '{}') \
                      ORDER BY source",
                     types[0], types[1], types[2], types[3]
@@ -580,7 +589,8 @@ impl RoamIndex for SqliteIndex {
                     let source: String = r.get(0)?;
                     let dest: String = r.get(1)?;
                     let kind: Option<String> = r.get(2)?;
-                    Ok(link_record(&source, &dest, kind.as_deref()))
+                    let pos: Option<i64> = r.get(3)?;
+                    Ok(link_record(&source, &dest, kind.as_deref(), pos))
                 })
                 .map_err(IndexError::Sqlite)?;
 
@@ -700,7 +710,7 @@ impl SqliteIndex {
 }
 
 /// Build a [`LinkRecord`] from decoded `links` table values.
-fn link_record(source: &str, dest: &str, kind: Option<&str>) -> LinkRecord {
+fn link_record(source: &str, dest: &str, kind: Option<&str>, pos: Option<i64>) -> LinkRecord {
     let source = emacsql::decode(source);
     let dest = emacsql::decode(dest);
     let kind = kind.map_or_else(|| "id".to_string(), emacsql::decode);
@@ -716,6 +726,7 @@ fn link_record(source: &str, dest: &str, kind: Option<&str>) -> LinkRecord {
         raw_dest: dest,
         kind,
         ref_target,
+        pos: pos.map(|p| usize::try_from(p).unwrap_or(0)),
     }
 }
 
@@ -1101,9 +1112,9 @@ pub mod emacsql {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute_batch(
             "CREATE TABLE nodes (id TEXT PRIMARY KEY, file TEXT, title TEXT, level INTEGER, pos INTEGER, todo TEXT, priority TEXT, olp TEXT); \
-             CREATE TABLE links (source TEXT, dest TEXT, type TEXT); \
+             CREATE TABLE links (source TEXT, dest TEXT, type TEXT, pos INTEGER); \
              INSERT INTO nodes (id, file, title, level, pos) VALUES ('\"source-id\"', '\"/tmp/s.org\"', '\"Source\"', 0, 0); \
-             INSERT INTO links (source, dest, type) VALUES ('\"source-id\"', '\"https://example.com\"', '\"https\"');"
+             INSERT INTO links (source, dest, type, pos) VALUES ('\"source-id\"', '\"https://example.com\"', '\"https\"', 0);"
         ).unwrap();
         drop(conn);
 

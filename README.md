@@ -123,7 +123,7 @@ The preferred way to build or refresh the `org-roam.db` cache is to let Emacs do
   - `validate`: `true` by default; opens the new database and reports its node count.
 - CLI: `org-roam-cli --roam-dir ~/org create-db [--db-path PATH] [--overwrite]`
 
-The native populator reuses the same filesystem scanner that powers `--no-db` mode, so the resulting database matches the scanner's view of the vault. It writes the org-roam v20 schema (`files`, `nodes`, `aliases`, `tags`, `refs`, `links`) and uses SHA1 file hashes compatible with `org-roam-db-sync`. Some org-roam-specific details (link/citation positions, full node properties) are populated with safe defaults; running `org-roam-db-sync` later will refresh those fields to their exact values.
+The native populator reuses the same filesystem scanner that powers `--no-db` mode, so the resulting database matches the scanner's view of the vault. It writes the org-roam v20 schema (`files`, `nodes`, `aliases`, `tags`, `refs`, `links`, `citations`) and uses SHA1 file hashes compatible with `org-roam-db-sync`. Link and citation positions are extracted from the source files; only full node property drawers are left as `nil` until `org-roam-db-sync` refreshes them.
 
 Because the server normally opens `org-roam.db` read-only, the populator is the only code path that writes the database file directly. It is gated as a write tool and is unavailable in `--read-only` mode.
 

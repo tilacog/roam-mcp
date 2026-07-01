@@ -8,10 +8,9 @@
 //! canonical cache that org-roam itself will maintain.
 //!
 //! The produced database is read by [`crate::index::sqlite::SqliteIndex`].
-//! Some org-roam-specific details (link/citation positions, node
-//! properties) are populated with safe defaults so the graph is usable
-//! immediately; running `org-roam-db-sync` later will refresh those
-//! fields to their exact org-roam values.
+//! Link and citation positions are extracted from the source files so the
+//! graph matches Emacs more closely; full node property drawers are left as
+//! `nil` until `org-roam-db-sync` refreshes them.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
@@ -36,6 +35,7 @@ pub struct PopulateStats {
     pub aliases: usize,
     pub tags: usize,
     pub refs: usize,
+    pub citations: usize,
 }
 
 /// Options controlling the native database build.
@@ -207,6 +207,7 @@ fn populate_tables(tx: &Transaction<'_>, walk: &WalkOutcome) -> IndexResult<Popu
 
     insert_refs(tx, walk, &mut stats)?;
     insert_links(tx, walk, &inserted_nodes, &mut stats)?;
+    insert_citations(tx, walk, &inserted_nodes, &mut stats)?;
 
     Ok(stats)
 }
@@ -319,10 +320,11 @@ fn insert_links(
             if !inserted_links.insert(key) {
                 continue;
             }
+            let pos = i64::try_from(link.pos.unwrap_or(0)).unwrap_or(0);
             tx.execute(
                 "INSERT INTO links (pos, source, dest, type, properties) VALUES (?, ?, ?, ?, ?)",
                 [
-                    "0".to_string(),
+                    pos.to_string(),
                     emacsql::quote(source),
                     emacsql::quote(&dest),
                     emacsql::quote(&link.kind),
@@ -331,6 +333,52 @@ fn insert_links(
             )
             .map_err(IndexError::Sqlite)?;
             stats.links += 1;
+        }
+    }
+    Ok(())
+}
+
+fn insert_citations(
+    tx: &Transaction<'_>,
+    walk: &WalkOutcome,
+    inserted_nodes: &HashSet<String>,
+    stats: &mut PopulateStats,
+) -> IndexResult<()> {
+    // In-body citations are represented as `cite` LinkRecords in the
+    // forward map. Insert each one into the citations table with its
+    // source position, matching org-roam's in-body citation tracking.
+    let mut inserted: HashSet<(String, String, usize)> = HashSet::new();
+    for (source, links) in &walk.forward {
+        if !inserted_nodes.contains(source) {
+            continue;
+        }
+        for link in links {
+            if link.kind != "cite" {
+                continue;
+            }
+            let Some(cite_key) = link
+                .ref_target
+                .as_ref()
+                .map(|s| s.trim_start_matches('@').to_string())
+            else {
+                continue;
+            };
+            let pos = link.pos.unwrap_or(0);
+            let key = (source.clone(), cite_key.clone(), pos);
+            if !inserted.insert(key) {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO citations (node_id, cite_key, pos, properties) VALUES (?, ?, ?, ?)",
+                [
+                    emacsql::quote(source),
+                    emacsql::quote(&cite_key),
+                    i64::try_from(pos).unwrap_or(0).to_string(),
+                    "nil".to_string(),
+                ],
+            )
+            .map_err(IndexError::Sqlite)?;
+            stats.citations += 1;
         }
     }
     Ok(())
@@ -568,6 +616,7 @@ mod tests {
                 raw_dest: "id:b".into(),
                 kind: "id".into(),
                 ref_target: None,
+                pos: None,
             }),
             "b"
         );
@@ -578,6 +627,7 @@ mod tests {
                 raw_dest: "https://example.com".into(),
                 kind: "https".into(),
                 ref_target: Some("https://example.com".into()),
+                pos: None,
             }),
             "//example.com"
         );
@@ -588,6 +638,7 @@ mod tests {
                 raw_dest: "@nora2023".into(),
                 kind: "cite".into(),
                 ref_target: Some("@nora2023".into()),
+                pos: None,
             }),
             "nora2023"
         );

@@ -112,7 +112,12 @@ pub struct LinkRecord {
 
     /// For URL/citation/file links, the full URL, @citekey, or file path.
     /// For `id:` links with anchors (scan backend only), the anchor suffix.
+    /// For links whose source position is known, the byte offset in the
+    /// source file.
     pub ref_target: Option<String>,
+
+    /// Byte offset of the link in the source file, when known.
+    pub pos: Option<usize>,
 }
 
 /// Search parameters for `RoamIndex::find_nodes`.

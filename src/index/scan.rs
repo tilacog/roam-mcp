@@ -546,7 +546,7 @@ fn build_file_node(
         todo: None,
         priority: None,
         olp: vec![],
-        pos: Some(0),
+        pos: Some(1),
         aliases,
         tags,
     }
@@ -562,6 +562,7 @@ type SectionRecords = (Vec<LinkRecord>, Vec<(String, String)>);
 /// headline nodes don't carry a bibliography path.
 fn pre_headline_links(document: &Document, id: &str) -> Option<SectionRecords> {
     let section = document.section()?;
+    let section_offset: usize = section.syntax().text_range().start().into();
     let mut links = Vec::new();
     for n in section.syntax().descendants() {
         if let Some(l) = Link::cast(n) {
@@ -571,7 +572,13 @@ fn pre_headline_links(document: &Document, id: &str) -> Option<SectionRecords> {
     let mut refs = Vec::new();
     // §4: walk the in-body citation objects and emit `cite`
     // `LinkRecord`s + ref pairs.
-    push_section_citations(&section.syntax().to_string(), id, &mut links, &mut refs);
+    push_section_citations(
+        &section.syntax().to_string(),
+        id,
+        section_offset,
+        &mut links,
+        &mut refs,
+    );
     Some((links, refs))
 }
 
@@ -621,7 +628,14 @@ fn headline_links(headline: &orgize::ast::Headline, owner: &str) -> SectionRecor
     // §4: in-body citation objects inside the headline's own
     // section also attribute to this node.
     if let Some(section) = headline.section() {
-        push_section_citations(&section.syntax().to_string(), owner, &mut links, &mut refs);
+        let section_offset: usize = section.syntax().text_range().start().into();
+        push_section_citations(
+            &section.syntax().to_string(),
+            owner,
+            section_offset,
+            &mut links,
+            &mut refs,
+        );
     }
     (links, refs)
 }
@@ -739,12 +753,14 @@ pub(crate) use crate::org::filetags::{file_level_tags, keyword_values, parse_str
 fn push_link(l: &Link, source_id: &str, out: &mut Vec<LinkRecord>) {
     let raw = l.path().to_string();
     let (kind, dest, ref_target) = classify_link(&raw);
+    let pos = usize::from(l.syntax().text_range().start());
     out.push(LinkRecord {
         source: source_id.to_string(),
         dest,
         raw_dest: raw,
         kind,
         ref_target,
+        pos: Some(pos),
     });
 }
 
@@ -762,6 +778,7 @@ fn push_link(l: &Link, source_id: &str, out: &mut Vec<LinkRecord>) {
 fn push_section_citations(
     section_text: &str,
     source_id: &str,
+    section_offset: usize,
     out: &mut Vec<LinkRecord>,
     refs: &mut Vec<(String, String)>,
 ) {
@@ -769,12 +786,14 @@ fn push_section_citations(
         if inside_org_link(section_text, pos) {
             continue;
         }
+        let absolute_pos = section_offset + pos;
         out.push(LinkRecord {
             source: source_id.to_string(),
             dest: None,
             raw_dest: raw,
             kind: "cite".to_string(),
             ref_target: Some(key.clone()),
+            pos: Some(absolute_pos),
         });
         refs.push((key, source_id.to_string()));
     }
@@ -1608,10 +1627,60 @@ mod tests {
             .expect("cite link record");
         assert_eq!(cite.raw_dest, "@nora2023");
         assert_eq!(cite.ref_target.as_deref(), Some("@nora2023"));
+        assert!(
+            cite.pos.is_some_and(|p| p > 0),
+            "cite position should be positive"
+        );
 
         let found = idx.by_ref("@nora2023").expect("by_ref");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, "22222222-2222-2222-2222-222222222222");
+    }
+
+    #[test]
+    fn link_records_carry_source_positions() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("links.org"),
+            ":PROPERTIES:\n\
+             :ID: 33333333-3333-3333-3333-333333333333\n\
+             :END:\n\
+             #+title: Links\n\n\
+             See [[id:22222222-2222-2222-2222-222222222222]] here.\n",
+        )
+        .unwrap();
+        let idx = ScanIndex::open(dir.path()).expect("open");
+        let fwd = idx
+            .forward_links("33333333-3333-3333-3333-333333333333")
+            .expect("forward");
+        let id_link = fwd.iter().find(|l| l.kind == "id").expect("id link record");
+        assert!(
+            id_link.pos.is_some_and(|p| p > 0),
+            "id link position should be positive"
+        );
+    }
+
+    #[test]
+    fn file_level_node_position_is_one() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("root.org"),
+            ":PROPERTIES:\n\
+             :ID: 44444444-4444-4444-4444-444444444444\n\
+             :END:\n\
+             #+title: Root\n",
+        )
+        .unwrap();
+        let idx = ScanIndex::open(dir.path()).expect("open");
+        let node = idx
+            .node("44444444-4444-4444-4444-444444444444")
+            .expect("lookup")
+            .expect("node exists");
+        assert_eq!(
+            node.pos,
+            Some(1),
+            "file-level node position matches org-roam"
+        );
     }
 
     #[test]
