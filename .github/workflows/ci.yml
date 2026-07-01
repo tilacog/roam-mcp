@@ -78,6 +78,5 @@ jobs:
       - name: Run Emacs integration tests
         run: |
           # Make the CI-installed org-roam discoverable to the test probe.
-          export EMACS_USER_DIR="$PWD/.ci-emacs.d"
-          export HOME="$PWD"
+          export ORG_ROAM_MCP_EMACS_USER_DIR="$PWD/.ci-emacs.d"
           cargo test --features emacs-tests --test emacs_populator_roundtrip -- --nocapture

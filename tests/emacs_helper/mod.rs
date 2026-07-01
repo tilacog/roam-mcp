@@ -8,6 +8,27 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+/// Directory used by Emacs for packages, if the `ORG_ROAM_MCP_EMACS_USER_DIR`
+/// environment variable is set. This lets CI install org-roam into an isolated
+/// directory and have the test probe discover it without touching the real
+/// `~/.emacs.d`.
+fn emacs_user_dir() -> Option<String> {
+    std::env::var("ORG_ROAM_MCP_EMACS_USER_DIR").ok()
+}
+
+/// Build the `--eval` forms that point Emacs at the right package directory.
+/// Returns an empty iterator when no override is configured.
+fn package_dir_args() -> Vec<String> {
+    let Some(dir) = emacs_user_dir() else {
+        return Vec::new();
+    };
+    let dir_escaped = elisp_string(&dir);
+    vec![
+        format!("(setq user-emacs-directory (file-name-as-directory {dir_escaped}))"),
+        "(setq package-user-dir (expand-file-name \"elpa\" user-emacs-directory))".to_string(),
+    ]
+}
+
 /// Find an Emacs executable on PATH. Prefer `emacs`, but accept `emacs-nox`
 /// (it is lighter and common in CI images). Returns `None` if neither exists.
 pub fn find_emacs() -> Option<&'static str> {
@@ -32,11 +53,15 @@ pub fn usable_emacs() -> Option<&'static str> {
     CACHE
         .get_or_init(|| {
             let bin = find_emacs()?;
-            let probe = Command::new(bin)
-                .arg("--batch")
+            let mut cmd = Command::new(bin);
+            cmd.arg("--batch")
                 .arg("--no-window-system")
                 .env_remove("DISPLAY")
-                .env_remove("WAYLAND_DISPLAY")
+                .env_remove("WAYLAND_DISPLAY");
+            for arg in package_dir_args() {
+                cmd.arg("--eval").arg(arg);
+            }
+            let probe = cmd
                 .arg("--eval")
                 .arg("(require 'package)")
                 .arg("--eval")
@@ -89,12 +114,15 @@ pub fn run_emacs_script(
     let id_locations = elisp_string(&vault_dir.join(".org-id-locations").to_string_lossy());
     let id_str = elisp_string(target_node_id);
 
-    Command::new(bin)
-        .arg("--batch")
+    let mut cmd = Command::new(bin);
+    cmd.arg("--batch")
         .arg("--no-window-system")
         .env_remove("DISPLAY")
-        .env_remove("WAYLAND_DISPLAY")
-        .arg("--eval")
+        .env_remove("WAYLAND_DISPLAY");
+    for arg in package_dir_args() {
+        cmd.arg("--eval").arg(arg);
+    }
+    cmd.arg("--eval")
         .arg(format!("(setq org-roam-directory {vault_str})"))
         .arg("--eval")
         .arg(format!("(setq org-roam-db-location {db_str})"))
