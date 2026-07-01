@@ -33,6 +33,9 @@ pub fn usable_emacs() -> Option<&'static str> {
             let bin = find_emacs()?;
             let probe = Command::new(bin)
                 .arg("--batch")
+                .arg("--no-window-system")
+                .env_remove("DISPLAY")
+                .env_remove("WAYLAND_DISPLAY")
                 .arg("--eval")
                 .arg("(require 'package)")
                 .arg("--eval")
@@ -82,6 +85,9 @@ pub fn run_emacs_script(
 
     Command::new(bin)
         .arg("--batch")
+        .arg("--no-window-system")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
         .arg("--eval")
         .arg(format!("(setq org-roam-directory {vault_str})"))
         .arg("--eval")
