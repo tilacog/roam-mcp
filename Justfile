@@ -29,3 +29,8 @@ crap: coverage
     cargo crap --lcov lcov.info --threshold 30 --fail-above
 
 ci: check-fmt clippy test crap
+
+# Emacs integration tests: verifies that a Rust-populated org-roam.db can be
+# read by Emacs org-roam. Requires Emacs and the org-roam package.
+emacs-tests:
+    cargo test --features emacs-tests --test emacs_populator_roundtrip

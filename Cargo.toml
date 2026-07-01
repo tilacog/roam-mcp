@@ -20,6 +20,12 @@ path = "src/bin/cli.rs"
 name = "org_roam_mcp"
 path = "src/lib.rs"
 
+[features]
+# Emacs integration tests: verifies that a DB created by the native
+# Rust populator can be read by Emacs org-roam. Requires Emacs and
+# org-roam to be installed; tests auto-skip when either is missing.
+emacs-tests = []
+
 [dependencies]
 rmcp = { version = "1.7", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "schemars"] }
 tokio = { version = "1", features = ["full"] }

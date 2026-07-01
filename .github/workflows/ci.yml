@@ -31,3 +31,30 @@ jobs:
 
       - name: Run CI
         run: just ci
+
+  emacs-tests:
+    name: Emacs reads Rust-populated DB
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Emacs and org-roam
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y emacs-nox
+          emacs --batch --eval "
+            (require 'package)
+            (add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)
+            (package-initialize)
+            (package-refresh-contents)
+            (package-install 'org-roam)
+          "
+
+      - name: Run Emacs integration tests
+        run: cargo test --features emacs-tests --test emacs_populator_roundtrip -- --nocapture

@@ -179,6 +179,22 @@ cargo test
 just ci   # fmt check + clippy (pedantic) + tests
 ```
 
+### Emacs integration tests
+
+The `emacs-tests` Cargo feature verifies that a database created by the native
+Rust populator can be read by Emacs org-roam. It is off by default because it
+requires Emacs and the org-roam package.
+
+```bash
+# Install Emacs and org-roam, then:
+cargo test --features emacs-tests --test emacs_populator_roundtrip
+# or:
+just emacs-tests
+```
+
+The test auto-skips when Emacs or org-roam are missing. CI runs it with
+`emacs-nox` and org-roam from MELPA.
+
 ## License
 
 MIT OR Apache-2.0
