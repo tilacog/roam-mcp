@@ -24,7 +24,7 @@ can lift into your own workflows.
 ## TL;DR for agents
 
 The server is a **read-write org-roam knowledge base** exposed over
-MCP. The 27 tools split into three groups:
+MCP. The 28 tools split into three groups:
 
 - **Read** (always available): `search_nodes`, `list_nodes`,
   `list_orphans`, `list_external_links`, `search_text`, `get_node`,
@@ -36,7 +36,7 @@ MCP. The 27 tools split into three groups:
 - **Write** (removed in `--read-only` mode): `create_node`,
   `update_node`, `delete_node`, `rename_node`, `append_to_node`,
   `prepend_to_node`, `add_link`, `insert_anchor`, `daily_capture`,
-  `add_tag`, `remove_tag`, `set_tags`.
+  `add_tag`, `remove_tag`, `set_tags`, `create_database`.
 - **Resources & prompts**: `org-roam://node/{id}` (+ `#anchor`),
   `summarize-node`, `link-suggestions`, `orphan-triage`,
   `tag-suggestions`.
@@ -246,7 +246,32 @@ What the agent does:
 3. Call `sync_database` again with `force: false` to confirm the
    drift list is now empty.
 
-### 9. "Build a reading list for a topic I'm starting to learn"
+### 9. "Create org-roam.db when Emacs is not running"
+
+You are setting up the vault on a machine without Emacs, or Emacs
+is not currently running, and you want a usable `org-roam.db` so the
+server can use the fast SQLite backend.
+
+```
+> Build org-roam.db from my .org files. I don't have Emacs running.
+```
+
+What the agent does:
+
+1. `create_database({ overwrite: false })` — builds the database
+   from the `.org` files in the vault using the native Rust
+   populator, then validates it by opening it with the SQLite
+   backend.
+2. `server_info()` — confirm `backend` is now `sqlite` and the db
+   path is reported.
+3. Later, when Emacs is available, `sync_database({ force: true })`
+   runs `org-roam-db-sync` to bring every detail (link positions,
+   full properties, citations table) to its canonical org-roam state.
+
+Set `overwrite: true` to replace an existing database. The tool
+backs up the old database before overwriting.
+
+### 10. "Build a reading list for a topic I'm starting to learn"
 
 ```
 > I want to learn about knowledge graphs. Find my notes on the
@@ -266,7 +291,7 @@ What the agent does:
    one `add_link` call each to wire the new notes into the existing
    graph.
 
-### 10. "Append research notes over a long session"
+### 11. "Append research notes over a long session"
 
 You are doing an open-ended research pass; you want every finding
 appended to one node without you having to remember where it lives.
@@ -286,7 +311,7 @@ What the agent does:
    "very large vault" })` to confirm all the bullets are findable
    from the rest of the vault.
 
-### 11. "Subscribe to a node so I get notified of edits"
+### 12. "Subscribe to a node so I get notified of edits"
 
 You want your client to be notified when a particular note changes
 (file watcher → `notifications/resources/updated`).
@@ -443,6 +468,7 @@ not the full schema.
 | `add_link` | `id` (source), `target`, `description?`, `headline?` | Write `[[id:target][desc]]` into the source |
 | `insert_anchor` | `id`, `search_text`, `anchor_name` | Place `<<name>>` before a matched paragraph; returns the `[[id:UUID::name]]` link |
 | `daily_capture` | `content?`, `headline?` | Create or open today's daily; optionally append |
+| `create_database` | `db_path?`, `overwrite?`, `validate?` | Build `org-roam.db` from `.org` files without Emacs |
 
 #### Important: `body` is the body, not the file
 

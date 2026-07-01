@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub mod populate;
 pub mod scan;
 pub mod sqlite;
 

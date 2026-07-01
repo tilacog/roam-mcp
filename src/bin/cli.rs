@@ -23,7 +23,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 
 use org_roam_mcp::index::{self, LinkRecord, RoamIndex};
-use org_roam_mcp::tools::{content, query};
+use org_roam_mcp::tools::{content, populate, query};
 use org_roam_mcp::Config;
 
 /// Extract all text content from a `CallToolResult` and print it.
@@ -123,6 +123,16 @@ enum Cmd {
     Forward {
         /// Node ID.
         id: String,
+    },
+
+    /// Create org-roam.db from the .org files without Emacs.
+    CreateDb {
+        /// Path to write the database to (default: configured db path).
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+        /// Overwrite an existing database.
+        #[arg(long, default_value_t = false)]
+        overwrite: bool,
     },
 }
 
@@ -263,6 +273,20 @@ fn cmd_forward(cli: &Cli, id: &str) -> Result<()> {
     Ok(())
 }
 
+fn cmd_create_db(cli: &Cli, db_path: Option<&PathBuf>, overwrite: bool) -> Result<()> {
+    let config = build_cli_config(cli)?;
+    let target = db_path.cloned().unwrap_or_else(|| config.db_path());
+    let params = populate::CreateDatabaseParams {
+        db_path: Some(target.display().to_string()),
+        overwrite,
+        validate: true,
+    };
+    let report = populate::create_database(&config, params)
+        .map_err(|e| anyhow::anyhow!("create_database: {e}"))?;
+    print_json(&report);
+    Ok(())
+}
+
 fn build_cli_config(cli: &Cli) -> Result<Config> {
     let mut c =
         Config::from_args(&cli.roam_dir, true, cli.no_db, None).context("building config")?;
@@ -307,6 +331,7 @@ fn try_dispatch_c(cli: &Cli, config: &Config) -> Option<Result<()>> {
 fn try_dispatch_d(cli: &Cli) -> Option<Result<()>> {
     Some(match &cli.command {
         Cmd::Forward { id } => cmd_forward(cli, id),
+        Cmd::CreateDb { db_path, overwrite } => cmd_create_db(cli, db_path.as_ref(), *overwrite),
         _ => return None,
     })
 }

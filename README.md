@@ -8,7 +8,7 @@ It lets MCP clients like Claude Desktop or Claude Code search, read, traverse, a
 
 Read tools: `search_nodes`, `list_nodes`, `list_orphans`, `list_external_links`, `search_text`, `get_node`, `get_node_by_path`, `get_node_section`, `get_backlinks`, `get_forward_links`, `find_by_ref`, `get_refs`, `list_tags`, `tag_cooccurrences`, `list_anchors`, `unlinked_references`, `validate_node`, `find_invalid_nodes`, `get_daily_note`, `list_dailies`, `server_info`, `sync_database`, `list_tasks`, `get_outline`, `list_files`, `list_node_tags`, `has_tag`, `search_by_tag`.
 
-Write tools: `create_node`, `update_node`, `delete_node`, `rename_node`, `append_to_node`, `prepend_to_node`, `add_link`, `insert_anchor`, `daily_capture`, `add_tag`, `remove_tag`, `set_tags`. Writes never touch `org-roam.db` directly. In `--read-only` mode they are removed from the tool router entirely.
+Write tools: `create_node`, `update_node`, `delete_node`, `rename_node`, `append_to_node`, `prepend_to_node`, `add_link`, `insert_anchor`, `daily_capture`, `add_tag`, `remove_tag`, `set_tags`, `create_database`. Writes never touch `org-roam.db` directly, with one exception: `create_database` builds the `org-roam.db` cache from `.org` files when Emacs is not available. In `--read-only` mode they are removed from the tool router entirely.
 
 A few details worth knowing:
 
@@ -98,6 +98,7 @@ org-roam-cli --roam-dir ~/org files
 org-roam-cli --roam-dir ~/org tags
 org-roam-cli --roam-dir ~/org backlinks <id>
 org-roam-cli --roam-dir ~/org forward <id>
+org-roam-cli --roam-dir ~/org create-db
 ```
 
 `--no-db` and `--db-path` work the same as the MCP server.
@@ -111,6 +112,20 @@ org-roam-cli --roam-dir ~/org forward <id>
   2. `full`: falls back to `emacs --batch` with a minimal `sync.el` when no daemon is reachable.
   3. `never`: skip entirely. Use `M-x org-roam-db-sync` manually, or rely on `org-roam-db-autosync-mode`.
 - Multiple writes within the debounce window (default 2s) coalesce into one sync call. Concurrent syncs are serialized to avoid SQLite write-lock races.
+
+## Creating `org-roam.db` without Emacs
+
+The preferred way to build or refresh the `org-roam.db` cache is to let Emacs do it via `org-roam-db-sync` (triggered by `sync_database` with `force:true`, or automatically after each write). When Emacs is **not** available, use the native populator:
+
+- MCP tool: `create_database`
+  - `db_path`: optional override (defaults to `<roam_dir>/org-roam.db` or `--db-path`).
+  - `overwrite`: `false` by default; set `true` to replace an existing database.
+  - `validate`: `true` by default; opens the new database and reports its node count.
+- CLI: `org-roam-cli --roam-dir ~/org create-db [--db-path PATH] [--overwrite]`
+
+The native populator reuses the same filesystem scanner that powers `--no-db` mode, so the resulting database matches the scanner's view of the vault. It writes the org-roam v20 schema (`files`, `nodes`, `aliases`, `tags`, `refs`, `links`) and uses SHA1 file hashes compatible with `org-roam-db-sync`. Some org-roam-specific details (link/citation positions, full node properties) are populated with safe defaults; running `org-roam-db-sync` later will refresh those fields to their exact values.
+
+Because the server normally opens `org-roam.db` read-only, the populator is the only code path that writes the database file directly. It is gated as a write tool and is unavailable in `--read-only` mode.
 
 ## Daily notes
 

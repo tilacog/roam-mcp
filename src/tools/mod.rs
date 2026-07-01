@@ -6,6 +6,7 @@
 //! `Config::can_write` and produce no DB mutations.
 
 pub mod content;
+pub mod populate;
 pub mod query;
 pub mod retrieval;
 pub mod sync_tool;

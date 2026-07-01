@@ -39,6 +39,7 @@ use crate::config::Config;
 use crate::index::{NodeMeta, NodeQuery, RoamIndex};
 use crate::sync::{DbSyncer, SyncMode};
 use crate::tools::content;
+use crate::tools::populate::{self, CreateDatabaseParams, CreateDatabaseReport};
 use crate::tools::query;
 use crate::tools::retrieval;
 use crate::tools::sync_tool::{self, SyncBackend, SyncDatabaseParams, SyncReport};
@@ -59,6 +60,7 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
 /// The names of the tools removed from the router in read-only mode.
 const WRITE_TOOLS: &[&str] = &[
+    "create_database",
     "create_node",
     "append_to_node",
     "prepend_to_node",
@@ -346,6 +348,17 @@ impl RoamServer {
                 "sync timed out after {timeout_ms} ms; it may still be running in the background"
             ));
         }
+    }
+
+    /// Build `org-roam.db` directly from the on-disk vault using the native
+    /// Rust populator. This does not require Emacs; it is the fallback for
+    /// bootstrapping a database where `org-roam-db-sync` cannot run.
+    fn run_create_database(
+        &self,
+        p: CreateDatabaseParams,
+    ) -> Result<CreateDatabaseReport, McpError> {
+        populate::create_database(&self.config, p)
+            .map_err(|e| McpError::internal_error(format!("create_database failed: {e}"), None))
     }
 
     /// Spawn a background task that watches the roam directory and the DB file.
@@ -714,6 +727,32 @@ impl RoamServer {
         p: Parameters<SyncDatabaseParams>,
     ) -> Result<CallToolResult, McpError> {
         let report = self.run_sync_database(p.0).await?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&report).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        description = "Create org-roam.db directly from the .org files in the vault, without requiring Emacs. This is a fallback for environments where org-roam-db-sync cannot run. By default it refuses to overwrite an existing database; set overwrite:true to replace it. After creation, the server switches to the SQLite backend."
+    )]
+    async fn create_database(
+        &self,
+        p: Parameters<CreateDatabaseParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let report = self.run_create_database(p.0)?;
+        // The watcher will notice the new db file and reload the index, but
+        // in case watching is disabled or delayed, proactively swap to the
+        // SQLite backend now.
+        if report.ok {
+            match crate::index::open(&self.config) {
+                Ok(idx) => {
+                    *self.index_cell.write().expect("index lock poisoned") = idx;
+                }
+                Err(e) => {
+                    tracing::warn!("created database but could not reload index: {e}");
+                }
+            }
+        }
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&report).unwrap_or_default(),
         )]))

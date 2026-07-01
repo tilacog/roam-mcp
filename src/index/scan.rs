@@ -208,23 +208,27 @@ impl RoamIndex for ScanIndex {
 
 /// Per-walk outputs of [`walk_org_files`]. The four maps are
 /// accumulated in one pass so we only read each `.org` file once.
-struct WalkOutcome {
-    nodes: HashMap<String, NodeMeta>,
-    forward: HashMap<String, Vec<LinkRecord>>,
-    refs: HashMap<String, Vec<String>>,
+pub(crate) struct WalkOutcome {
+    pub(crate) nodes: HashMap<String, NodeMeta>,
+    pub(crate) forward: HashMap<String, Vec<LinkRecord>>,
+    pub(crate) refs: HashMap<String, Vec<String>>,
     /// Basename slug → file-node ids that claim it. Used in a later
     /// pass to resolve `[[id:<slug>]]` links that name a file by its
     /// basename instead of by `:ID:`.
-    slug_candidates: HashMap<String, Vec<String>>,
+    pub(crate) slug_candidates: HashMap<String, Vec<String>>,
+    /// Absolute file path → file-level title, for callers that need to
+    /// populate a `files` table without re-reading the file.
+    pub(crate) file_titles: HashMap<PathBuf, String>,
 }
 
 /// Walk `dir` and merge every readable `.org` file into a [`WalkOutcome`].
-fn walk_org_files(dir: &Path) -> WalkOutcome {
+pub(crate) fn walk_org_files(dir: &Path) -> WalkOutcome {
     let mut out = WalkOutcome {
         nodes: HashMap::new(),
         forward: HashMap::new(),
         refs: HashMap::new(),
         slug_candidates: HashMap::new(),
+        file_titles: HashMap::new(),
     };
 
     for entry in WalkDir::new(dir)
@@ -250,7 +254,7 @@ fn walk_org_files(dir: &Path) -> WalkOutcome {
 /// Return the path of an entry iff it is a regular `.org` file the
 /// scanner is willing to read. Filters out directories, non-org
 /// extensions, and Emacs lockfiles (`.#foo.org`).
-fn is_readable_org_file(entry: &walkdir::DirEntry) -> Option<PathBuf> {
+pub(crate) fn is_readable_org_file(entry: &walkdir::DirEntry) -> Option<PathBuf> {
     if !entry.file_type().is_file() {
         return None;
     }
@@ -269,7 +273,9 @@ fn is_readable_org_file(entry: &walkdir::DirEntry) -> Option<PathBuf> {
 }
 
 /// Merge a single parsed file's results into the walk outcome.
-fn merge_parsed_file(parsed: ParsedFile, path: &Path, out: &mut WalkOutcome) {
+pub(crate) fn merge_parsed_file(parsed: ParsedFile, path: &Path, out: &mut WalkOutcome) {
+    out.file_titles
+        .insert(path.to_path_buf(), parsed.file_title.clone());
     for (r, node_id) in parsed.refs {
         out.refs.entry(r).or_default().push(node_id);
     }
@@ -430,14 +436,17 @@ fn collect_name_keywords(nodes: &HashMap<String, NodeMeta>) -> HashMap<PathBuf, 
 }
 
 /// Parsed-in-memory view of a single `.org` file used during the scan.
-struct ParsedFile {
-    nodes: Vec<NodeMeta>,
-    forward: HashMap<String, Vec<LinkRecord>>,
+pub(crate) struct ParsedFile {
+    pub(crate) nodes: Vec<NodeMeta>,
+    pub(crate) forward: HashMap<String, Vec<LinkRecord>>,
     /// `(ref value, declaring node id)` pairs from `ROAM_REFS`.
-    refs: Vec<(String, String)>,
+    pub(crate) refs: Vec<(String, String)>,
     /// The `:ID:` of the file-level node, if the file has one. Used to map
     /// the file's basename slug to a node for `[[id:<slug>]]` resolution.
-    file_node_id: Option<String>,
+    pub(crate) file_node_id: Option<String>,
+    /// File-level title, derived from `#+TITLE:` or the first headline.
+    /// Independent of whether the file has a file-level `:ID:`.
+    pub(crate) file_title: String,
 }
 
 impl ParsedFile {
@@ -490,6 +499,7 @@ impl ParsedFile {
             forward,
             refs,
             file_node_id: file_id,
+            file_title: file_title(&doc, path),
         }
     }
 }
