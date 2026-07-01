@@ -25,7 +25,8 @@ pub fn find_emacs() -> Option<&'static str> {
 }
 
 /// `Some(bin)` only if Emacs is present *and* `(require 'org-roam)` succeeds.
-/// Cached because the probe takes a non-trivial Emacs startup.
+/// Cached because the probe takes a non-trivial Emacs startup. Prints the
+/// Emacs stderr to aid CI debugging when the probe fails.
 pub fn usable_emacs() -> Option<&'static str> {
     static CACHE: OnceLock<Option<String>> = OnceLock::new();
     CACHE
@@ -46,9 +47,14 @@ pub fn usable_emacs() -> Option<&'static str> {
                 .arg("(princ \"ok\")")
                 .output()
                 .ok()?;
-            if probe.status.success() && String::from_utf8_lossy(&probe.stdout).contains("ok") {
+            let stdout = String::from_utf8_lossy(&probe.stdout);
+            let stderr = String::from_utf8_lossy(&probe.stderr);
+            if probe.status.success() && stdout.contains("ok") {
                 Some(bin.to_string())
             } else {
+                eprintln!("Emacs org-roam probe failed (status={:?}):", probe.status);
+                eprintln!("stdout:\n{stdout}");
+                eprintln!("stderr:\n{stderr}");
                 None
             }
         })

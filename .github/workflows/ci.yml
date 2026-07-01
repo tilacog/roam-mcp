@@ -46,15 +46,38 @@ jobs:
 
       - name: Install Emacs and org-roam
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y emacs-nox
-          emacs --batch --eval "
-            (require 'package)
-            (add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)
-            (package-initialize)
-            (package-refresh-contents)
-            (package-install 'org-roam)
-          "
+
+          # Isolate CI package state from any pre-existing ~/.emacs.d.
+          export EMACS_USER_DIR="$PWD/.ci-emacs.d"
+          mkdir -p "$EMACS_USER_DIR/elpa"
+
+          # Install org-roam from MELPA into the isolated directory.
+          emacs --batch \
+                --no-window-system \
+                --eval "(setq user-emacs-directory \"$EMACS_USER_DIR/\")" \
+                --eval "(setq package-user-dir (expand-file-name \"elpa\" user-emacs-directory))" \
+                --eval "(require 'package)" \
+                --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+                --eval "(package-initialize)" \
+                --eval "(package-refresh-contents)" \
+                --eval "(package-install 'org-roam)"
+
+          # Verify org-roam is actually loadable from that directory.
+          emacs --batch \
+                --no-window-system \
+                --eval "(setq user-emacs-directory \"$EMACS_USER_DIR/\")" \
+                --eval "(setq package-user-dir (expand-file-name \"elpa\" user-emacs-directory))" \
+                --eval "(require 'package)" \
+                --eval "(package-initialize)" \
+                --eval "(require 'org-roam)" \
+                --eval "(princ \"org-roam-loadable\")"
 
       - name: Run Emacs integration tests
-        run: cargo test --features emacs-tests --test emacs_populator_roundtrip -- --nocapture
+        run: |
+          # Make the CI-installed org-roam discoverable to the test probe.
+          export EMACS_USER_DIR="$PWD/.ci-emacs.d"
+          export HOME="$PWD"
+          cargo test --features emacs-tests --test emacs_populator_roundtrip -- --nocapture
