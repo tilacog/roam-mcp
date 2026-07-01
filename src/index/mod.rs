@@ -88,6 +88,10 @@ impl NodeMeta {
 /// kind `dest` is `None`. `raw_dest` is the link target text as written
 /// (or as stored in `org-roam.db`). For URL and citation links,
 /// `ref_target` holds the full URL or `@citekey`.
+///
+/// For `id:` links with an anchor suffix (`id:UUID::anchor`), the scan
+/// backend populates `ref_target` with the anchor; the `SQLite` backend
+/// cannot because org-roam's database stores only the resolved UUID.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LinkRecord {
     /// Node ID of the linking node (the source).
@@ -106,6 +110,7 @@ pub struct LinkRecord {
     pub kind: String,
 
     /// For URL/citation/file links, the full URL, @citekey, or file path.
+    /// For `id:` links with anchors (scan backend only), the anchor suffix.
     pub ref_target: Option<String>,
 }
 

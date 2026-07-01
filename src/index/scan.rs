@@ -864,8 +864,12 @@ fn find_citation_keys(text: &str) -> Vec<(String, String, usize)> {
 /// `SQLite` backend (see [`LinkRecord::kind`]).
 fn classify_link(raw: &str) -> (String, Option<String>, Option<String>) {
     if let Some(rest) = raw.strip_prefix("id:") {
-        let (id, _anchor) = split_anchor(rest);
-        return ("id".to_string(), Some(id.to_string()), None);
+        let (id, anchor) = split_anchor(rest);
+        return (
+            "id".to_string(),
+            Some(id.to_string()),
+            anchor.map(std::convert::Into::into),
+        );
     }
     if raw.starts_with("roam:") {
         return ("roam".to_string(), None, None);
@@ -1102,15 +1106,15 @@ mod tests {
     // --- §0.2: id::anchor link classification ---
 
     #[test]
-    fn id_link_with_anchor_suffix_keeps_dest_drops_anchor() {
+    fn id_link_with_anchor_suffix_keeps_dest_preserves_anchor() {
         // `[[id:UUID::verse-4]]` is classified as kind:"id", dest:"UUID"
         // (the anchor suffix is dropped from the destination since the
-        // backlink graph is node-level, not per-anchor), and the raw
-        // target preserves the suffix verbatim for round-tripping.
+        // backlink graph is node-level, not per-anchor), and ref_target
+        // preserves the anchor for anchor-level backlink analysis.
         let (k, d, r) = classify_link("id:11111111-2222-3333-4444-555555555555::verse-4");
         assert_eq!(k, "id");
         assert_eq!(d.as_deref(), Some("11111111-2222-3333-4444-555555555555"));
-        assert_eq!(r, None);
+        assert_eq!(r.as_deref(), Some("verse-4"));
         // The full raw target is also preserved on the LinkRecord. We
         // assert the classifier doesn't strip the anchor by checking
         // split_anchor directly.
@@ -1122,11 +1126,10 @@ mod tests {
     #[test]
     fn id_anchor_suffix_aggregates_backlinks_node_level() {
         // Two source files link to the same UUID with two different
-        // anchor suffixes. The backlink graph is node-level: both
-        // produce records on the destination, and there is no way to
-        // distinguish which anchor was used (that's a property to
-        // assert, not a bug to fix). The `raw_dest` keeps the full
-        // link target so callers can recover the suffix per record.
+        // anchor suffixes. The backlink graph is node-level (same dest),
+        // but the `ref_target` field now carries the anchor so callers
+        // CAN distinguish which anchor was used. The `raw_dest` also
+        // keeps the full link target for round-tripping.
         let dir = tempfile::tempdir().expect("tmpdir");
         std::fs::write(
             dir.path().join("target.org"),
